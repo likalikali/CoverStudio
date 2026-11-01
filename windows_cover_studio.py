@@ -290,9 +290,7 @@ def install() -> None:
     call([str(uv), "sync", "--extra", "stem", "--python", sys.executable], cwd=TSUMUGI)
     if not TSUMUGI_PY.is_file():
         raise RuntimeError(f"tsumugi 没有生成预期的 Windows Python：{TSUMUGI_PY}")
-    say("\n[5/5] 降低转录 batch-size 并检查环境")
-    patch_worker_batch_size()
-    patch_worker_ffmpeg_handle()
+    say("\n[5/5] 检查环境（转录 batch 档位通过启动环境变量传递，不修改 Worker 源文件）")
     cuda_cover = check_pytorch(COVER_PY, "Cover Studio")
     cuda_tsumugi = check_pytorch(TSUMUGI_PY, "tsumugi")
     if not cuda_cover or not cuda_tsumugi:
