@@ -202,9 +202,15 @@ class Runner:
         job.state, job.finished = state, now()
         try:
             self._on_end(job)
-        except Exception:
+        except Exception as e:
             log.exception("ジョブの後片付けに失敗しました")
-        job._ended.set()
+            message = f"Finalization failed: {type(e).__name__}: {e}"
+            job.add_log(message)
+            job.error = f"{job.error}; {message}" if job.error else message
+            if state == "done":
+                job.state = "error"
+        finally:
+            job._ended.set()
 
     def _start_queued(self, job_id: str) -> Job | None:
         """Atomically claim a queued job so cancel() and shutdown cannot race it."""

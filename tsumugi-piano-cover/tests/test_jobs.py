@@ -56,3 +56,27 @@ def test_runner_rejects_submissions_after_close():
 
     with pytest.raises(RuntimeError, match="job runner is closed"):
         runner.submit("generate", "song")
+
+
+
+def test_finalizer_failure_marks_job_error_and_runner_continues():
+    finalized = []
+
+    def finalize(job):
+        finalized.append(job.id)
+        if len(finalized) == 1:
+            raise RuntimeError("persist failed")
+
+    runner = Runner(lambda _job: None, finalize)
+    try:
+        first = runner.submit("generate", "song")
+        second = runner.submit("generate", "another-song")
+
+        assert first._ended.wait(2)
+        assert second._ended.wait(2)
+        assert first.state == "error"
+        assert "Finalization failed: RuntimeError: persist failed" in first.error
+        assert second.state == "done"
+        assert runner._thread.is_alive()
+    finally:
+        runner.close()
