@@ -193,7 +193,14 @@ def _checkpoint_bool(path: Path, key: str) -> bool | None:
         for index, (opcode, value, _position) in enumerate(operations[:-1]):
             if opcode.name not in string_ops or value != key:
                 continue
-            next_opcode, next_value, _next_position = operations[index + 1]
+            next_index = index + 1
+            while next_index < len(operations) and operations[next_index][0].name in {
+                "BINPUT", "LONG_BINPUT", "PUT", "MEMOIZE"
+            }:
+                next_index += 1
+            if next_index >= len(operations):
+                return None
+            next_opcode, next_value, _next_position = operations[next_index]
             if next_opcode.name == "NEWTRUE":
                 return True
             if next_opcode.name == "NEWFALSE":
