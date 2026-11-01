@@ -305,6 +305,8 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
         """音源 (と、あれば採譜済みの MIDI) からプロジェクトを作る。MIDI がなければ tsumugi の採譜を始める"""
         if audio is None and midi is None:
             raise HTTPException(400, "音源か MIDI のどちらかが要ります")
+        if midi is None and engine.tsumugi is None:
+            raise HTTPException(400, "tsumugi が見つからないので採譜できません (MIDI を一緒に入れてください)")
         audio_path = None
         midi_path = None
         try:
