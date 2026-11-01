@@ -478,36 +478,42 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     @app.get("/api/projects/{pid}/takes/{tid}/cover.mid")
     def get_take_midi(pid: str, tid: str):
-        p = open_project(pid)
-        take = find_take(p, tid)
-        path = p.take_midi(tid)
-        if not path.is_file():
-            raise HTTPException(404, "まだ生成していません")
-        # 旧版で発生した 28-bit MIDI delta wrap を、配布前に一度だけ安全に復旧する。
-        validate_take_midi(p, take, path)
-        # メタデータなしで書かれた古いテイクだけ、ここで 1 回だけ直す (書き込みは一時ファイル -> 置換)。
-        # 毎回書き直すと秒 -> tick の丸めが積もって音が少しずつずれるうえ、同時のダウンロードと
-        # ぶつかって書きかけのファイルを返すことがある。直したら take.json に印を残す。
-        source_created = (p.data.get("source") or {}).get("created")
-        recorded = take.get("source_created")
-        if recorded is not None:
-            same_source = recorded == source_created
-        else:  # 印がない古いテイク: 原曲がテイクより後に作られていれば、別の原曲に入れ替わっている
-            same_source = source_created is None or source_created <= (take.get("created") or "")
-        # 原曲の拍を書き直した (SheetSage の拍にした・小節ごとのテンポにした) 後のテイクも、同じように 1 回だけ写し直す
-        source_beats = (p.data.get("source") or {}).get("beats_map")
-        stale = not take.get("metadata_copied") or take.get("source_beats") != source_beats
-        if p.has_source and stale and same_source:
-            try:
-                from piano_cover.metadata import copy_metadata
+        # Validation/legacy repair and metadata copy can replace cover.mid. Serialize
+        # these read-triggered writes with other per-project mutations and downloads.
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            take = find_take(p, tid)
+            path = p.take_midi(tid)
+            if not path.is_file():
+                raise HTTPException(404, "まだ生成していません")
+            # 旧版で発生した 28-bit MIDI delta wrap を、配布前に一度だけ安全に復旧する。
+            validate_take_midi(p, take, path)
+            # メタデータなしで書かれた古いテイクだけ、ここで 1 回だけ直す (書き込みは一時ファイル -> 置換)。
+            # 毎回書き直すと秒 -> tick の丸めが積もって音が少しずつずれるうえ、同時のダウンロードと
+            # ぶつかって書きかけのファイルを返すことがある。直したら take.json に印を残す。
+            source_created = (p.data.get("source") or {}).get("created")
+            recorded = take.get("source_created")
+            if recorded is not None:
+                same_source = recorded == source_created
+            else:  # 印がない古いテイク: 原曲がテイクより後に作られていれば、別の原曲に入れ替わっている
+                same_source = source_created is None or source_created <= (take.get("created") or "")
+            # 原曲の拍を書き直した (SheetSage の拍にした・小節ごとのテンポにした) 後のテイクも、同じように 1 回だけ写し直す
+            source_beats = (p.data.get("source") or {}).get("beats_map")
+            stale = not take.get("metadata_copied") or take.get("source_beats") != source_beats
+            if p.has_source and stale and same_source:
+                try:
+                    from piano_cover.metadata import copy_metadata
 
-                copy_metadata(p.source_path, path)
-                p.update_take(tid, metadata_copied=True, source_beats=source_beats)
-            except Exception:  # 写せなくても、中身 (音) は返す
-                log.exception("cover.mid にメタデータを写せませんでした: %s", path)
-        validate_take_midi(p, take, path)
-        name = f"{safe_name(p.data['title'])}_{take['name'] or tid}.mid"
-        return FileResponse(path, media_type="audio/midi", headers={"Content-Disposition": _attachment(name)})
+                    copy_metadata(p.source_path, path)
+                    p.update_take(tid, metadata_copied=True, source_beats=source_beats)
+                except Exception:  # 写せなくても、中身 (音) は返す
+                    log.exception("cover.mid にメタデータを写せませんでした: %s", path)
+            validate_take_midi(p, take, path)
+            name = f"{safe_name(p.data['title'])}_{take['name'] or tid}.mid"
+            response = FileResponse(
+                path, media_type="audio/midi", headers={"Content-Disposition": _attachment(name)}
+            )
+        return response
 
     @app.post("/api/projects/{pid}/takes/{tid}/score")
     def score_take(pid: str, tid: str, body: ScoreIn):
@@ -548,13 +554,16 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
     def get_take_view(pid: str, tid: str):
         from .midi_view import cover_view
 
-        p = open_project(pid)
-        take = find_take(p, tid)
-        path = p.take_midi(tid)
-        if not path.is_file():
-            raise HTTPException(404, "まだ生成していません")
-        validate_take_midi(p, take, path)
-        return cover_view(path)
+        # Timeline repair may replace the MIDI in-place; share the same project lock
+        # as the download/metadata migration route.
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            take = find_take(p, tid)
+            path = p.take_midi(tid)
+            if not path.is_file():
+                raise HTTPException(404, "まだ生成していません")
+            validate_take_midi(p, take, path)
+            return cover_view(path)
 
     # ------------------------------------------------------------ 好み
     def style_view(style: dict) -> dict:
