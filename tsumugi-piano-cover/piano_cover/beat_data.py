@@ -287,6 +287,10 @@ class BeatCoverDataset(Dataset):
             note_beats = grid.beat_position(notes[:, ONSET])
             note_source = source_grid.frames_at(np.interp(note_beats, np.arange(len(position)), position))
             bounds = source_grid.frames_at(np.concatenate([s0, s1[-1:]]))
+        # Melody dropout is an encoder-input augmentation only. Keep the
+        # undropped reference rows for arrangement labels, otherwise fill/above
+        # targets change when the source melody is randomly hidden.
+        arrangement_rows = rows.copy()
         item_source = empty_source()
         item_source["src_patch_start"] = torch.zeros(1, dtype=torch.long)
         if has_source:
@@ -313,7 +317,7 @@ class BeatCoverDataset(Dataset):
                 target = self.plan_target(quantized, grid, position, source_grid, S)
                 if self.arrangement:
                     source_bounds = source_grid.frames_at(source_grid.bar_starts[: S + 1].astype(np.float64))
-                    values = arrangement_values(events, note_source, rows, source_bounds, fr)
+                    values = arrangement_values(events, note_source, arrangement_rows, source_bounds, fr)
                     target = np.concatenate([target, values.astype(np.float32)], axis=1)
                 item_source["plan_target"] = torch.from_numpy(target)
 
@@ -338,7 +342,7 @@ class BeatCoverDataset(Dataset):
         if self.dynamics_bins:
             index = quantize_dynamics(bar_dynamics(quantized, grid, tok, start, total), self.dynamics_bins)
             if self.arrangement:
-                values = arrangement_values(events, note_source, rows, bounds, fr)
+                values = arrangement_values(events, note_source, arrangement_rows, bounds, fr)
                 index = np.concatenate([index, quantize_dynamics(values, self.dynamics_bins)], axis=1)
             if self.dynamics_dropout > 0:
                 if random.random() < self.dynamics_dropout:
