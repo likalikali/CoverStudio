@@ -399,10 +399,20 @@ class BatchGrammar:
         after_time = (stage == self.AFTER_TIME) & self._same_onset(
             torch.zeros_like(self.order), torch.full_like(self.last_pitch, -1)
         )
-        # 残りトークン数で 1 イベントが収まる場合だけ新しいイベントを始められる
-        room = (self.length + 5 <= max_tokens)[:, None]
-        new_time = room & (v >= tok.time_offset + self.onset[:, None] + 1) & (v < tok.time_offset + self.time_limit)
-        same = room & (self.onset >= 0)[:, None] & self._same_onset(self.order, self.last_pitch)
+        # Training tokenization reserves exactly the tokens needed for the event
+        # plus one EOP/EOS. A new onset needs TIME + PITCH + DUR + VEL + end;
+        # same-onset notes need only PITCH + DUR + VEL + end, and pedal changes
+        # need one event token + end. Do not use the new-onset budget for all.
+        new_time_room = (self.length + 5 <= max_tokens)[:, None]
+        same_note_room = (self.length + 4 <= max_tokens)[:, None]
+        same_pedal_room = (self.length + 2 <= max_tokens)[:, None]
+        new_time = new_time_room & (v >= tok.time_offset + self.onset[:, None] + 1) & (
+            v < tok.time_offset + self.time_limit
+        )
+        same_onset = (self.onset >= 0)[:, None] & self._same_onset(self.order, self.last_pitch)
+        same_note = (v >= tok.pitch_offset) & (v < tok.duration_offset)
+        same_pedal = (v == PEDAL_ON) | (v == PEDAL_OFF)
+        same = (same_note_room & same_note | same_pedal_room & same_pedal) & same_onset
         event_start = (stage == self.EVENT_START) & (end | new_time | same)
         mask = torch.where(limit, end, after_pitch | after_duration | after_time | event_start)
         return torch.where(self.finished[:, None], v == PAD, mask)
