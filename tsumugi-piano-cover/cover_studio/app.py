@@ -16,7 +16,7 @@ import logging
 import random
 import shutil
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
@@ -189,6 +189,10 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     runner = Runner(handle, on_end)
 
+    def project_busy(pid: str) -> bool:
+        """Project jobs plus style training, which reads favorite takes across projects."""
+        return bool(runner.active_for(pid)) or any(job.kind == "style" for job in runner.active_for(""))
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
@@ -325,7 +329,7 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
     def delete_project(pid: str):
         with runner.project_lock(pid):
             p = open_project(pid)
-            if runner.active_for(pid):
+            if project_busy(pid):
                 raise HTTPException(409, "実行中・待ちのジョブがあります")
             p.delete()
             runner.forget(pid)
@@ -335,7 +339,7 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
     def transcribe(pid: str):
         with runner.project_lock(pid):
             p = open_project(pid)
-            if runner.active_for(pid):
+            if project_busy(pid):
                 raise HTTPException(409, "この曲の処理中は採譜を始められません。処理が終わってから再試行してください")
             submit_transcribe(p)
             return detail(p)
@@ -355,10 +359,10 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
         try:
             with runner.project_lock(pid):
                 p = open_project(pid)
-                if runner.active_for(pid):
+                if project_busy(pid):
                     raise HTTPException(
                         409,
-                        "採譜・生成・楽譜化など、この曲の処理中は原曲 MIDI を差し替えられません。処理が終わってから再試行してください",
+                        "採譜・生成・楽譜化・好みの学習など、処理中は原曲 MIDI を差し替えられません。処理が終わってから再試行してください",
                     )
                 p.set_source(path, "upload")
         finally:
@@ -437,17 +441,20 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     @app.patch("/api/projects/{pid}/takes/{tid}")
     def update_take(pid: str, tid: str, body: TakePatch):
-        p = open_project(pid)
-        find_take(p, tid)
-        return p.update_take(tid, **body.model_dump(exclude_none=True))
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            find_take(p, tid)
+            return p.update_take(tid, **body.model_dump(exclude_none=True))
 
     @app.delete("/api/projects/{pid}/takes/{tid}", status_code=204)
     def delete_take(pid: str, tid: str):
         with runner.project_lock(pid):
             p = open_project(pid)
             find_take(p, tid)
-            if any(tid in j.takes for j in runner.active_for(pid)):
-                raise HTTPException(409, "生成中・待ちのテイクは先に止めてください")
+            if any(tid in j.takes for j in runner.active_for(pid)) or any(
+                j.kind == "style" for j in runner.active_for("")
+            ):
+                raise HTTPException(409, "生成中・待ち、または好みの学習中のテイクは先に処理を止めてください")
             p.delete_take(tid)
 
     def expected_take_midi_end(p: Project, take: dict) -> float | None:
@@ -587,28 +594,31 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
     @app.post("/api/styles")
     def create_style(body: StyleIn):
         """今のお気に入り (全曲の、音源のある曲のもの) から、好みのベクトルを学習するジョブを始める"""
-        try:
-            entry = engine.entry(body.model)
-        except ValueError as e:
-            raise HTTPException(400, str(e)) from e
-        favorites = [f for f in favorite_takes() if f["audio"]]
-        if not favorites:
-            raise HTTPException(400, "音源のある曲のお気に入りがありません")
-        # 初期値: このモデルで作ったお気に入りの演奏者 (なければ全部のお気に入りの演奏者) の埋め込みの平均。
-        # 好みで作ったテイクの演奏者の番号は意味がないので数えない
-        numbered = [f for f in favorites if not f["style"]]
-        init = [f["channel"] for f in numbered if f["model"] == entry.id] or [f["channel"] for f in numbered] or [0]
-        if entry.num_channels:
-            init = [c if c < entry.num_channels else 0 for c in init]
-        name = body.name.strip() or f"好み {len(styles.list()) + 1}"
-        style = styles.create(
-            name,
-            {"id": entry.id, "label": entry.label},
-            [{"project": f["project"], "take": f["take"]} for f in favorites],
-            init,
-        )
-        runner.submit("style", "", [style["id"]])
-        return style_view(style)
+        with ExitStack() as stack:
+            for project in sorted(projects(root), key=lambda item: item.id):
+                stack.enter_context(runner.project_lock(project.id))
+            try:
+                entry = engine.entry(body.model)
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from e
+            favorites = [f for f in favorite_takes() if f["audio"]]
+            if not favorites:
+                raise HTTPException(400, "音源のある曲のお気に入りがありません")
+            # 初期値: このモデルで作ったお気に入りの演奏者 (なければ全部のお気に入りの演奏者) の埋め込みの平均。
+            # 好みで作ったテイクの演奏者の番号は意味がないので数えない
+            numbered = [f for f in favorites if not f["style"]]
+            init = [f["channel"] for f in numbered if f["model"] == entry.id] or [f["channel"] for f in numbered] or [0]
+            if entry.num_channels:
+                init = [c if c < entry.num_channels else 0 for c in init]
+            name = body.name.strip() or f"好み {len(styles.list()) + 1}"
+            style = styles.create(
+                name,
+                {"id": entry.id, "label": entry.label},
+                [{"project": f["project"], "take": f["take"]} for f in favorites],
+                init,
+            )
+            runner.submit("style", "", [style["id"]])
+            return style_view(style)
 
     def find_style(sid: str) -> dict:
         try:
