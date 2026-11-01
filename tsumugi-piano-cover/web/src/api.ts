@@ -96,7 +96,14 @@ export type ProjectDetail = {
   title: string;
   created: string;
   audio: string | null;
-  source: { origin: string; created: string } | null;
+  source: {
+    origin: string;
+    created: string;
+    beats?: string;
+    beats_audio_sha1?: string;
+    beats_map?: string;
+    beats_annotation_sha1?: string;
+  } | null;
   transcribe: Transcribe | null;
   takes: Take[];
   busy: boolean;

@@ -70,7 +70,16 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
   });
   const data = project.data;
   const sourceView = useQuery({
-    queryKey: ["source-view", pid, data?.source?.created],
+    // SheetSage can rewrite the source MIDI's beat map after transcription
+    // without changing source.created. Include its annotation fingerprint so
+    // the piano roll refreshes when that in-place metadata migration completes.
+    queryKey: [
+      "source-view",
+      pid,
+      data?.source?.created,
+      data?.source?.beats_map,
+      data?.source?.beats_annotation_sha1,
+    ],
     queryFn: () => api.sourceView(pid),
     enabled: !!data?.source,
     staleTime: Infinity,
