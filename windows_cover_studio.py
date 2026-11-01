@@ -118,8 +118,24 @@ def ensure_clone(url: str, folder: Path) -> None:
     call(["git", "clone", "--depth", "1", url, str(folder)])
 
 
+def _cuda126_source(source: str, label: str) -> str:
+    if "torch==2.13.0+cu130" in source and "https://download.pytorch.org/whl/cu130" in source:
+        return source.replace("torch==2.13.0+cu130", "torch==2.13.0+cu126").replace(
+            "https://download.pytorch.org/whl/cu130", "https://download.pytorch.org/whl/cu126"
+        )
+    if "torch==2.13.0+cu126" in source and "https://download.pytorch.org/whl/cu126" in source:
+        return source
+    if "pytorch-cu130" in source and "https://download.pytorch.org/whl/cu130" in source:
+        return source.replace("pytorch-cu130", "pytorch-cu126").replace(
+            "https://download.pytorch.org/whl/cu130", "https://download.pytorch.org/whl/cu126"
+        )
+    if "pytorch-cu126" in source and "https://download.pytorch.org/whl/cu126" in source:
+        return source
+    raise RuntimeError(f"{label} 上游依赖发生变化，无法安全替换 CUDA 版本，请检查原文件。")
+
+
 def patch_cuda_126_sources() -> None:
-    """Make both upstream projects use official PyTorch CUDA 12.6 wheels.
+    """Preflight both dependency files, then update them as one rollback-safe operation.
 
     nvidia-smi's 'CUDA Version: 12.9' is the driver's supported runtime API;
     it does not require a wheel with the same minor number.
@@ -129,30 +145,49 @@ def patch_cuda_126_sources() -> None:
     if not requirements.is_file() or not project.is_file():
         raise RuntimeError("缺少上游依赖配置，无法应用 CUDA 12.6 兼容补丁。")
 
-    source = requirements.read_text(encoding="utf-8")
-    if "torch==2.13.0+cu130" in source and "https://download.pytorch.org/whl/cu130" in source:
-        fixed = source.replace("torch==2.13.0+cu130", "torch==2.13.0+cu126")
-        fixed = fixed.replace("https://download.pytorch.org/whl/cu130", "https://download.pytorch.org/whl/cu126")
-        requirements.write_text(fixed, encoding="utf-8")
+    # Validate both inputs before changing either file. An upstream change in
+    # tsumugi must not leave Cover Studio's requirements half-patched.
+    originals = {
+        requirements: requirements.read_bytes(),
+        project: project.read_bytes(),
+    }
+    updated = {
+        requirements: _cuda126_source(originals[requirements].decode("utf-8"), "Cover Studio").encode("utf-8"),
+        project: _cuda126_source(originals[project].decode("utf-8"), "tsumugi").encode("utf-8"),
+    }
+
+    staged: list[tuple[Path, Path, bytes]] = []
+    replaced: list[tuple[Path, bytes]] = []
+    try:
+        for path, content in updated.items():
+            if content == originals[path]:
+                continue
+            temporary = path.with_name(path.name + ".cuda126.tmp")
+            staged.append((path, temporary, originals[path]))
+            temporary.write_bytes(content)
+
+        for path, temporary, original in staged:
+            temporary.replace(path)
+            replaced.append((path, original))
+    except Exception:
+        for path, original in reversed(replaced):
+            rollback = path.with_name(path.name + ".cuda126.rollback")
+            rollback.write_bytes(original)
+            rollback.replace(path)
+        raise
+    finally:
+        for _path, temporary, _original in staged:
+            temporary.unlink(missing_ok=True)
+
+    if updated[requirements] != originals[requirements]:
         say("✓ Cover Studio requirements.txt：torch 2.13.0+cu126")
-    elif "torch==2.13.0+cu126" in source and "https://download.pytorch.org/whl/cu126" in source:
+    else:
         say("✓ Cover Studio 已设置 CUDA 12.6")
-    else:
-        raise RuntimeError("Cover Studio 上游依赖发生变化，无法安全替换 CUDA 版本，请查看 requirements.txt。")
-
-    source = project.read_text(encoding="utf-8")
-    if "pytorch-cu130" in source and "https://download.pytorch.org/whl/cu130" in source:
-        fixed = source.replace("pytorch-cu130", "pytorch-cu126")
-        fixed = fixed.replace("https://download.pytorch.org/whl/cu130", "https://download.pytorch.org/whl/cu126")
-        project.write_text(fixed, encoding="utf-8")
+    if updated[project] != originals[project]:
         say("✓ tsumugi pyproject.toml：torch / torchaudio 使用 cu126 索引")
-    elif "pytorch-cu126" in source and "https://download.pytorch.org/whl/cu126" in source:
-        say("✓ tsumugi 已设置 CUDA 12.6")
     else:
-        raise RuntimeError("tsumugi 上游依赖发生变化，无法安全替换 CUDA 版本，请查看 pyproject.toml。")
-
+        say("✓ tsumugi 已设置 CUDA 12.6")
     say("注意：tsumugi 的 uv.lock 原来锁定 cu130；下一步 uv sync 会重新解析并更新本地锁文件。")
-
 
 def get_window_batch_size() -> int:
     """Read the local performance profile; default safely to batch=1."""
