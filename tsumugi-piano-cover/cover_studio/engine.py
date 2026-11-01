@@ -269,7 +269,8 @@ class Engine:
         self._model = None
         self._model_id: str | None = None
         self._sources: OrderedDict[tuple, object] = OrderedDict()
-        self._lock = threading.Lock()
+        # unload() is also called from model()/score_model() while jobs hold this lock.
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------ モデル
     @property
@@ -337,16 +338,20 @@ class Engine:
 
     def unload(self) -> None:
         """モデル (カバーか楽譜化) を手放して VRAM を空ける (採譜の前・UI のボタン)"""
-        if self._model is None:
-            return
-        self._model = None
-        self._model_id = None
-        self._sources.clear()
-        gc.collect()
-        import torch
+        # Serialize manual unload with inference/model loading. RLock is required
+        # because model() and score_model() call unload() while holding this lock.
+        with self._lock:
+            if self._model is None:
+                self._sources.clear()
+                return
+            self._model = None
+            self._model_id = None
+            self._sources.clear()
+            gc.collect()
+            import torch
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _source(self, project: Project, model, progress: Callable[[float, str], None], log: Callable[[str], None]):
         from piano_ar.beat_tokenizer import BeatTokenizer

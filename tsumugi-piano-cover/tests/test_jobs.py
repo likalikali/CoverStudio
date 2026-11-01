@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import threading
 
-from cover_studio.jobs import Runner
+import pytest
+
+from cover_studio.jobs import Job, Runner
 
 
 def test_project_lock_is_stable_and_serializes_threads():
@@ -31,3 +33,26 @@ def test_project_lock_is_stable_and_serializes_threads():
         assert not thread.is_alive()
     finally:
         runner.close()
+
+
+
+def test_cancelled_queued_job_cannot_be_claimed_by_worker():
+    runner = Runner(lambda _job: pytest.fail("cancelled queued job was executed"), lambda _job: None)
+    job = Job("queued-job", "generate", "song")
+    try:
+        with runner._lock:
+            runner._jobs[job.id] = job
+
+        assert runner.cancel(job.id) is job
+        assert job.state == "cancelled"
+        assert runner._start_queued(job.id) is None
+    finally:
+        runner.close()
+
+
+def test_runner_rejects_submissions_after_close():
+    runner = Runner(lambda _job: None, lambda _job: None)
+    runner.close()
+
+    with pytest.raises(RuntimeError, match="job runner is closed"):
+        runner.submit("generate", "song")
