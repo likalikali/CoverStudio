@@ -48,7 +48,7 @@ def _latest_build_commit(timeout: float = 5.0) -> str | None:
     with urllib.request.urlopen(request, timeout=timeout) as response:
         release = json.loads(response.read().decode("utf-8"))
     body = release.get("body") or ""
-    match = re.search(r"CoverStudio main UI build \\(([0-9a-f]{7,40})\\)", body)
+    match = re.search(r"CoverStudio main UI build \(([0-9a-f]{7,40})\)", body)
     return match.group(1) if match else None
 
 
@@ -56,9 +56,9 @@ def _validate_archive_members(archive: zipfile.ZipFile, root: Path) -> None:
     root = root.resolve()
     for info in archive.infolist():
         name = info.filename
-        if not name or "\\x00" in name:
+        if not name or "\x00" in name:
             raise ValueError("画面の zip に無効なファイル名があります")
-        normalized = name.replace("\\\\", "/")
+        normalized = name.replace("\\", "/")
         posix_name = PurePosixPath(normalized)
         windows_name = PureWindowsPath(normalized)
         if posix_name.is_absolute() or windows_name.is_absolute() or windows_name.drive:
