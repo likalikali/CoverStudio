@@ -1,0 +1,54 @@
+name: python
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "windows_cover_studio.py"
+      - "tsumugi-piano-cover/cover_studio/**"
+      - "tsumugi-piano-cover/piano_ar/**"
+      - "tsumugi-piano-cover/piano_cover/**"
+      - "tsumugi-piano-cover/piano_perf2score/**"
+      - "tsumugi-piano-cover/piano_score/**"
+      - "tsumugi-piano-cover/tests/**"
+      - "tsumugi-piano-cover/.github/workflows/python.yml"
+  pull_request:
+    paths:
+      - "windows_cover_studio.py"
+      - "tsumugi-piano-cover/cover_studio/**"
+      - "tsumugi-piano-cover/piano_ar/**"
+      - "tsumugi-piano-cover/piano_cover/**"
+      - "tsumugi-piano-cover/piano_perf2score/**"
+      - "tsumugi-piano-cover/piano_score/**"
+      - "tsumugi-piano-cover/tests/**"
+      - "tsumugi-piano-cover/.github/workflows/python.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tsumugi-piano-cover
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.13.0+cpu --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install numpy symusic "mido>=1.3.3" pytest
+      - name: Compile backend modules
+        run: python -m compileall -q cover_studio piano_ar piano_cover piano_perf2score piano_score
+      - name: Run regression tests
+        run: python -m pytest -q tests

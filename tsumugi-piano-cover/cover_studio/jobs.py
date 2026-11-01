@@ -130,6 +130,8 @@ class Runner:
         self._jobs: dict[str, Job] = {}
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._lock = threading.Lock()
+        self._project_locks: dict[str, threading.RLock] = {}
+        self._project_locks_guard = threading.Lock()
         self._thread = threading.Thread(target=self._work, name="cover-studio-runner", daemon=True)
         self._thread.start()
 
@@ -164,6 +166,11 @@ class Runner:
 
     def active_for(self, project: str) -> list[Job]:
         return [j for j in self.jobs(project) if j.active]
+
+    def project_lock(self, project: str) -> threading.RLock:
+        """Return a stable per-project lock for API mutations and job submission."""
+        with self._project_locks_guard:
+            return self._project_locks.setdefault(project, threading.RLock())
 
     def cancel(self, job_id: str) -> Job | None:
         """待っていれば取り消し、実行中なら止める指示を出す (止まるまで少しかかる)"""

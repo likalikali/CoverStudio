@@ -54,6 +54,13 @@ def file_sha1(path: Path) -> str:
     return h.hexdigest()
 
 
+def file_identity(path: str | Path) -> tuple[str, int, int, str]:
+    """Content-aware cache identity; detects same-size replacements with preserved mtimes."""
+    path = Path(path)
+    stat = path.stat()
+    return str(path), stat.st_mtime_ns, stat.st_size, file_sha1(path)
+
+
 def safe_name(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
     return name[:80] or "song"

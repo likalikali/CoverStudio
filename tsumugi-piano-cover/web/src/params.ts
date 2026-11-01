@@ -62,11 +62,18 @@ export function performerText(params: Params, t: Dict, styleName: (id: string) =
 }
 
 /** 既定値から変えた項目 (テイクの一覧に出す) */
-export function diffChips(params: Params, defaults: Params, t: Dict, styleName: (id: string) => string | null): string[] {
+export function diffChips(
+  params: Params,
+  defaults: Params,
+  t: Dict,
+  styleName: (id: string) => string | null,
+  tokenizerType?: "time" | "beat" | null,
+): string[] {
   const chips: string[] = [];
   if (params.style) chips.push(t.chipStyle(styleName(params.style) ?? t.deletedStyle));
   else if (params.channel) chips.push(t.chipPerformer(params.channel));
   for (const def of ALL_SLIDERS) {
+    if (tokenizerType === "beat" && def.key === "onset_bias") continue;
     if (def.key === "channel_cfg" && !params.channel && !params.style) continue;
     if (!params.arrangement && ["fill", "above", "span"].includes(def.key)) continue;
     const value = params[def.key];
