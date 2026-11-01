@@ -105,3 +105,37 @@ def test_download_web_replaces_ui_after_validated_extract(tmp_path, monkeypatch)
     assert (dest / "BUILD_COMMIT").read_text(encoding="ascii") == "b" * 40
     assert (dest / "assets" / "app.js").is_file()
     assert not list(tmp_path.glob(".static-*"))
+
+
+
+def test_latest_build_commit_parses_full_sha_from_release_notes(monkeypatch):
+    import json
+
+    commit = "c" * 40
+    payload = json.dumps({"body": f"CoverStudio main UI build ({commit})."}).encode("utf-8")
+    monkeypatch.setattr(
+        web.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: BytesIO(payload),
+    )
+
+    assert web._latest_build_commit() == commit
+
+
+def test_download_web_rejects_windows_style_path_traversal(tmp_path, monkeypatch):
+    dest = tmp_path / "static"
+    dest.mkdir()
+    (dest / "index.html").write_text("old", encoding="utf-8")
+    payload = make_web_zip(
+        [
+            ("index.html", "new"),
+            ("..\\\\outside.txt", "must not escape"),
+        ]
+    )
+    monkeypatch.setattr(web.urllib.request, "urlopen", lambda *_args, **_kwargs: BytesIO(payload))
+
+    with pytest.raises(ValueError, match="展開先外"):
+        web.download_web("https://example.invalid/web.zip", dest)
+
+    assert (dest / "index.html").read_text(encoding="utf-8") == "old"
+    assert not (tmp_path / "outside.txt").exists()
