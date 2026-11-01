@@ -476,7 +476,7 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
         except Exception as exc:
             raise HTTPException(422, f"このテイクの MIDI 時間軸が壊れています: {exc}") from exc
 
-        @app.get("/api/projects/{pid}/takes/{tid}/cover.mid")
+    @app.get("/api/projects/{pid}/takes/{tid}/cover.mid")
     def get_take_midi(pid: str, tid: str):
         # Validation/legacy repair and metadata copy can replace cover.mid. Serialize
         # these read-triggered writes with other per-project mutations and downloads.
@@ -550,7 +550,7 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
             headers={"Content-Disposition": _attachment(name), "Cache-Control": "no-cache"},
         )
 
-        @app.get("/api/projects/{pid}/takes/{tid}/view")
+    @app.get("/api/projects/{pid}/takes/{tid}/view")
     def get_take_view(pid: str, tid: str):
         from .midi_view import cover_view
 
