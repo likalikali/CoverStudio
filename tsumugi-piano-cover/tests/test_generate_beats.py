@@ -28,7 +28,7 @@ def test_generate_uses_actual_source_bar_starts(monkeypatch):
         "valid": np.ones((2, 1), dtype=bool),
         "patch_start": np.array([0, 48], dtype=np.int64),
     }
-    source = PreparedSource(np.zeros((0, 5), dtype=np.int32), 0, features, grid, grid.bar_beats, np.ones(2))
+    source = PreparedSource(np.zeros((0, 6), dtype=np.int32), 0, features, grid, grid.bar_beats, np.ones(2))
     seen = []
 
     def fake_generate(*args, **kwargs):

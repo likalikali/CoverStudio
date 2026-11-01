@@ -94,7 +94,7 @@ def test_copy_metadata_writes_once_and_atomically(tmp_path):
     assert [pitch for _, pitch in after] == [pitch for _, pitch in before]
     for (got, _), (expect, _) in zip(after, before):
         assert abs(got - expect) < 0.002  # 1 回の丸めだけ
-    assert not list(tmp_path.glob("*.tmp"))  # 一時ファイルを残さない
+    assert not list(tmp_path.glob("*.tmp.mid"))  # 一時ファイルを残さない
 
 
 @pytest.mark.parametrize("tpq", [96, 384, 480, 960])
