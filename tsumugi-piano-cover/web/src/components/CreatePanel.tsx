@@ -186,8 +186,14 @@ export function CreatePanel(props: Props) {
                   </label>
                 )}
               </div>
-              {text.note && <div className="group-note">{text.note}</div>}
-              {group.sliders.map((def) => slider(def, group.id === "arrangement" && !params.arrangement))}
+              {group.id === "source" && model?.tokenizer_type === "beat" ? (
+                <div className="group-note">{t.beatGridRhythmNote}</div>
+              ) : (
+                text.note && <div className="group-note">{text.note}</div>
+              )}
+              {group.sliders
+                .filter((def) => def.key !== "onset_bias" || model?.tokenizer_type !== "beat")
+                .map((def) => slider(def, group.id === "arrangement" && !params.arrangement))}
             </section>
           );
         })}

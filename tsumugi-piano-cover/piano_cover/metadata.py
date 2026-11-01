@@ -98,7 +98,8 @@ def copy_metadata(source: str | Path, target: str | Path) -> bool:
     sort_score_events(out)
     expected_end = float(out.end())
     expected_notes = sum(len(track.notes) for track in out.tracks)
-    tmp = Path(target).with_suffix(".mid.tmp")
+    target = Path(target)
+    tmp = target.with_name(f"{target.stem}.tmp{target.suffix}")
     try:
         out.dump_midi(str(tmp))
         check = Score(str(tmp)).to("second")
@@ -193,7 +194,8 @@ def apply_sheetsage_beats(path: str | Path, annotation: dict) -> bool:
     score = Score(str(path)).to("second")
     if not set_sheetsage_beats(score, annotation):
         return False
-    tmp = Path(path).with_suffix(".mid.tmp")
+    path = Path(path)
+    tmp = path.with_name(f"{path.stem}.tmp{path.suffix}")
     score.dump_midi(str(tmp))
     os.replace(tmp, path)
     return True

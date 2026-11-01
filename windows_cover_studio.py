@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import shutil
 import socket
 import subprocess
@@ -170,29 +169,6 @@ def get_window_batch_size() -> int:
         return 1
 
 
-def patch_worker_batch_size() -> bool:
-    """Apply the selected persistent profile without touching other worker settings."""
-    target = COVER / "cover_studio" / "tsumugi_worker.py"
-    if not target.is_file():
-        say("⚠ 找不到 tsumugi_worker.py，未能调整 batch-size。")
-        return False
-    selected = get_window_batch_size()
-    source = target.read_text(encoding="utf-8")
-    pattern = r"(parser\.add_argument\(\s*['\"]--window-batch-size['\"]\s*,\s*type\s*=\s*int\s*,\s*default\s*=\s*)(\d+)(\s*\))"
-    match = re.search(pattern, source)
-    if not match:
-        say("⚠ worker 上游代码发生变化，找不到 window-batch-size 参数；未改动。")
-        return False
-    actual = int(match.group(2))
-    if actual == selected:
-        say(f"✓ 转录性能档位已生效：window-batch-size={selected}。")
-        return True
-    changed = re.sub(pattern, lambda m: m.group(1) + str(selected) + m.group(3), source, count=1)
-    target.write_text(changed, encoding="utf-8")
-    say(f"✓ 已切换转录性能：window-batch-size={actual} → {selected}。")
-    return True
-
-
 def is_shared_ffmpeg(path: Path) -> bool:
     """Require a complete FFmpeg shared installation, not scrcpy's partial DLLs."""
     try:
@@ -236,19 +212,6 @@ def ffmpeg_shared_bin() -> Path | None:
         if is_shared_ffmpeg(p):
             return p.resolve()
     return None
-
-
-def patch_worker_ffmpeg_handle() -> None:
-    """Keep Windows DLL directory handle alive until tsumugi transcription exits."""
-    target = COVER / "cover_studio" / "tsumugi_worker.py"
-    if not target.is_file():
-        return
-    source = target.read_text(encoding="utf-8")
-    old = '        os.add_dll_directory(str(Path(args.ffmpeg_dir).resolve()))'
-    new = '        _ffmpeg_dll_handle = os.add_dll_directory(str(Path(args.ffmpeg_dir).resolve()))'
-    if old in source and new not in source:
-        target.write_text(source.replace(old, new, 1), encoding="utf-8")
-        say("✓ Windows FFmpeg DLL 加载句柄已修复。")
 
 
 def check_pytorch(py: Path, label: str) -> bool:
@@ -356,8 +319,6 @@ def start(mode: str) -> None:
     if is_port_open(PORT):
         raise RuntimeError(f"端口 {PORT} 已被占用。若 Cover Studio 已启动，打开 http://127.0.0.1:{PORT} 。")
     batch = get_window_batch_size()
-    patch_worker_batch_size()
-    patch_worker_ffmpeg_handle()
     has_gpu = nvidia_report()
     if not has_gpu:
         raise RuntimeError("未检测到 NVIDIA GPU。请先修复驱动，或自行使用官方 --device cpu 模式。")
@@ -378,6 +339,7 @@ def start(mode: str) -> None:
     if ffmpeg:
         cmd.extend(["--ffmpeg-dir", str(ffmpeg)])
     env = os.environ.copy()
+    env["COVERSTUDIO_TSUMUGI_WINDOW_BATCH_SIZE"] = str(batch)
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["HF_HOME"] = str(BASE / "cache" / "huggingface")
@@ -421,7 +383,6 @@ def check() -> None:
     nvidia_report()
     check_pytorch(COVER_PY, "Cover Studio")
     check_pytorch(TSUMUGI_PY, "tsumugi")
-    patch_worker_ffmpeg_handle()
     ffmpeg = ffmpeg_shared_bin()
     say(f"FFmpeg Shared DLL: {ffmpeg or '未找到完整的 FFmpeg Shared（请运行 06_fix_ffmpeg_torchcodec.bat）'}")
     say(f"数据目录：{DATA}")

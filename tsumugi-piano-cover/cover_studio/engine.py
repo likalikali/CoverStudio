@@ -18,6 +18,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import pickletools
 import random
 import subprocess
 import sys
@@ -31,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .project import Project, file_sha1
+from .project import Project, file_identity, file_sha1
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKER = Path(__file__).resolve().parent / "tsumugi_worker.py"
@@ -79,6 +80,7 @@ class ModelEntry:
     spec: str  # load_cover に渡すもの (フォルダ・.pt・repository)
     planner: str | None = None
     num_channels: int | None = None
+    tokenizer_type: str | None = None  # time | beat (None only for legacy/unknown checkpoints)
 
 
 def _checkpoint_has(path: Path, key: bytes) -> bool:
@@ -97,6 +99,27 @@ def _is_cover_checkpoint(path: Path) -> bool:
     return _checkpoint_has(path, b"cover_config")
 
 
+def _checkpoint_tokenizer_type(path: Path) -> str | None:
+    """Read the lightweight tokenizer_type field from a torch checkpoint pickle."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            name = next(n for n in archive.namelist() if n.endswith("/data.pkl"))
+            with archive.open(name) as stream:
+                payload = stream.read(1 << 22)
+        strings = [
+            value
+            for opcode, value, _ in pickletools.genops(payload)
+            if opcode.name in {"BINUNICODE", "SHORT_BINUNICODE", "BINUNICODE8", "UNICODE"}
+            and isinstance(value, str)
+        ]
+        for index, value in enumerate(strings[:-1]):
+            if value == "tokenizer_type" and strings[index + 1] in {"beat", "time"}:
+                return strings[index + 1]
+    except (OSError, EOFError, ValueError, zipfile.BadZipFile, StopIteration):
+        return None
+    return None
+
+
 def find_models(
     pretrained_dir: Path | None, checkpoints_dir: Path | None, hub_repos: list[str] | tuple[str, ...]
 ) -> list[ModelEntry]:
@@ -105,7 +128,13 @@ def find_models(
 
     names = {HF_REPO_V2: "V2", HF_REPO_V1: "V1"}
     entries: list[ModelEntry] = [
-        ModelEntry(f"hub:{repo}", f"{names[repo]} ({repo})" if repo in names else f"{repo} (Hugging Face)", "hub", repo)
+        ModelEntry(
+            f"hub:{repo}",
+            f"{names[repo]} ({repo})" if repo in names else f"{repo} (Hugging Face)",
+            "hub",
+            repo,
+            tokenizer_type="beat" if repo == HF_REPO_V2 else "time" if repo == HF_REPO_V1 else None,
+        )
         for repo in hub_repos
     ]
     if pretrained_dir is not None and pretrained_dir.is_dir():
@@ -120,14 +149,21 @@ def find_models(
             rel = folder.relative_to(pretrained_dir.parent).as_posix()
             entries.append(
                 ModelEntry(
-                    f"export:{rel}", rel, "export", str(folder), None, config["model_config"].get("num_channels")
+                    f"export:{rel}",
+                    rel,
+                    "export",
+                    str(folder),
+                    None,
+                    config["model_config"].get("num_channels"),
+                    config.get("tokenizer_type"),
                 )
             )
     if checkpoints_dir is not None and checkpoints_dir.is_dir():
         found = [p for p in checkpoints_dir.rglob("best.pt") if _is_cover_checkpoint(p)]
         for path in sorted(found, key=lambda p: p.stat().st_mtime, reverse=True):
             rel = path.relative_to(checkpoints_dir).as_posix()
-            entries.append(ModelEntry(f"checkpoint:{rel}", rel, "checkpoint", str(path)))
+            tokenizer_type = _checkpoint_tokenizer_type(path)
+            entries.append(ModelEntry(f"checkpoint:{rel}", rel, "checkpoint", str(path), tokenizer_type=tokenizer_type))
             for planner in sorted(path.parent.glob("planner*.pt")):
                 if "features" in planner.name:
                     continue
@@ -138,6 +174,7 @@ def find_models(
                         "checkpoint",
                         str(path),
                         str(planner),
+                        tokenizer_type=tokenizer_type,
                     )
                 )
     return entries
@@ -279,6 +316,9 @@ class Engine:
         log(f"モデルを読んでいます: {entry.label}")
         self._model = load_cover(entry.spec, planner=entry.planner, device=self.device)
         self._model_id = entry.id
+        from piano_ar.beat_tokenizer import BeatTokenizer
+
+        entry.tokenizer_type = "beat" if isinstance(self._model.tokenizer, BeatTokenizer) else "time"
         entry.num_channels = self._model.decoder.config.num_channels
         style_slot(self._model)  # 好みのベクトルを入れる行
         return self._model
@@ -321,15 +361,13 @@ class Engine:
         # COVERSTUDIO_SOURCE_CACHE_HASH_V1: copies can preserve mtime_ns while contents change.
         # A cache hit must depend on the actual MIDI/annotation bytes, not timestamps alone.
         key = (
-            str(path),
-            path.stat().st_mtime_ns,
-            file_sha1(path),
+            file_identity(path),
             self._model_id,
-            annotation and (str(annotation), annotation.stat().st_mtime_ns, file_sha1(annotation)),
+            file_identity(annotation) if annotation is not None else None,
         )
         frames = self._frames(project, progress, log) if c.frame_dims else None
         if frames is not None:
-            key += (str(frames), frames.stat().st_mtime_ns)
+            key += (file_identity(frames),)
         if key not in self._sources:
             frame_data = None
             if frames is not None:

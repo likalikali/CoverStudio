@@ -115,6 +115,18 @@ def validate_completed_transcription_midi(merged: Path) -> None:
             "Check the earlier CUDA/OOM and post-processing warnings in the log."
         )
 
+def default_window_batch_size() -> int:
+    """Use the launcher-selected profile without rewriting this source file."""
+    raw = os.environ.get("COVERSTUDIO_TSUMUGI_WINDOW_BATCH_SIZE")
+    if raw is None:
+        return 2
+    try:
+        value = int(raw)
+    except ValueError:
+        return 1
+    return value if value in (1, 2, 3, 4) else 1
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tsumugi-dir", required=True, help="tsumugi のリポジトリ (チェックポイントもここに置かれる)")
@@ -124,7 +136,7 @@ def main() -> None:
     parser.add_argument("--ffmpeg-dir", default=None, help="FFmpeg の共有ライブラリ版の bin (Windows の torchcodec 用)")
     parser.add_argument("--device", default="auto", help="auto / cuda / cpu")
     parser.add_argument("--compile", action="store_true", help="torch.compile を使う (初回の準備に時間がかかる)")
-    parser.add_argument("--window-batch-size", type=int, default=2)
+    parser.add_argument("--window-batch-size", type=int, default=default_window_batch_size())
     parser.add_argument(
         "--gpu-memory-limit", type=float, default=0.9, help="起動時の空き VRAM のうち使ってよい割合 (0 で無制限)"
     )

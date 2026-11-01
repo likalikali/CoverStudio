@@ -16,7 +16,7 @@ import logging
 import random
 import shutil
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
@@ -189,6 +189,10 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     runner = Runner(handle, on_end)
 
+    def project_busy(pid: str) -> bool:
+        """Project jobs plus style training, which reads favorite takes across projects."""
+        return bool(runner.active_for(pid)) or any(job.kind == "style" for job in runner.active_for(""))
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
@@ -323,20 +327,22 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     @app.delete("/api/projects/{pid}", status_code=204)
     def delete_project(pid: str):
-        p = open_project(pid)
-        if runner.active_for(pid):
-            raise HTTPException(409, "実行中・待ちのジョブがあります")
-        p.delete()
-        runner.forget(pid)
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            if project_busy(pid):
+                raise HTTPException(409, "実行中・待ちのジョブがあります")
+            p.delete()
+            runner.forget(pid)
 
     # ------------------------------------------------------------ 原曲
     @app.post("/api/projects/{pid}/transcribe")
     def transcribe(pid: str):
-        p = open_project(pid)
-        if any(j.kind == "transcribe" for j in runner.active_for(pid)):
-            raise HTTPException(409, "採譜は実行中です")
-        submit_transcribe(p)
-        return detail(p)
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            if project_busy(pid):
+                raise HTTPException(409, "この曲の処理中は採譜を始められません。処理が終わってから再試行してください")
+            submit_transcribe(p)
+            return detail(p)
 
     @app.get("/api/projects/{pid}/transcribe/live")
     def transcribe_live(pid: str, since: int = 0):
@@ -349,12 +355,16 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     @app.put("/api/projects/{pid}/source")
     def upload_source(pid: str, midi: Annotated[UploadFile, File()]):
-        p = open_project(pid)
-        if any(j.kind == "transcribe" for j in runner.active_for(pid)):
-            raise HTTPException(409, "採譜の実行中は差し替えられません")
         path = save_upload(midi, MIDI_EXTS)
         try:
-            p.set_source(path, "upload")
+            with runner.project_lock(pid):
+                p = open_project(pid)
+                if project_busy(pid):
+                    raise HTTPException(
+                        409,
+                        "採譜・生成・楽譜化・好みの学習など、処理中は原曲 MIDI を差し替えられません。処理が終わってから再試行してください",
+                    )
+                p.set_source(path, "upload")
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
         return detail(p)
@@ -385,42 +395,43 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
     # ------------------------------------------------------------ テイク
     @app.post("/api/projects/{pid}/takes")
     def generate(pid: str, body: GenerateIn):
-        p = open_project(pid)
-        if not p.has_source:
-            raise HTTPException(400, "原曲の MIDI がまだありません")
-        try:
-            entry = engine.entry(body.model)
-        except ValueError as e:
-            raise HTTPException(400, str(e)) from e
-        if body.continue_from is not None:
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            if not p.has_source:
+                raise HTTPException(400, "原曲の MIDI がまだありません")
             try:
-                source_take = p.take(body.continue_from.take)
-            except KeyError as e:
-                raise HTTPException(404, f"テイクがありません: {body.continue_from.take}") from e
-            if source_take["state"] != "done":
-                raise HTTPException(400, "生成が終わったテイクからだけ続きを作れます")
-        params = studio_params(body.params)
-        if params["style"]:
-            try:
-                style = styles.get(params["style"])
-            except KeyError as e:
-                raise HTTPException(400, "好みが見つかりません (消したかもしれません)") from e
-            if style["state"] != "done":
-                raise HTTPException(400, "この好みはまだ学習が終わっていません")
-            if style["model"]["id"] != entry.id:
-                raise HTTPException(
-                    400, f"この好みは {style['model']['label']} で学習したものです。同じモデルで使ってください"
-                )
-        record = {
-            "params": params,
-            "model": {"id": entry.id, "label": entry.label},
-            "seed": body.seed if body.seed is not None else random.randrange(2**31),
-            "count": body.count,
-            "continue_from": body.continue_from.model_dump() if body.continue_from else None,
-        }
-        takes = p.new_takes(body.count, record)
-        runner.submit("generate", pid, [t["id"] for t in takes])
-        return detail(p)
+                entry = engine.entry(body.model)
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from e
+            if body.continue_from is not None:
+                try:
+                    source_take = p.take(body.continue_from.take)
+                except KeyError as e:
+                    raise HTTPException(404, f"テイクがありません: {body.continue_from.take}") from e
+                if source_take["state"] != "done":
+                    raise HTTPException(400, "生成が終わったテイクからだけ続きを作れます")
+            params = studio_params(body.params)
+            if params["style"]:
+                try:
+                    style = styles.get(params["style"])
+                except KeyError as e:
+                    raise HTTPException(400, "好みが見つかりません (消したかもしれません)") from e
+                if style["state"] != "done":
+                    raise HTTPException(400, "この好みはまだ学習が終わっていません")
+                if style["model"]["id"] != entry.id:
+                    raise HTTPException(
+                        400, f"この好みは {style['model']['label']} で学習したものです。同じモデルで使ってください"
+                    )
+            record = {
+                "params": params,
+                "model": {"id": entry.id, "label": entry.label, "tokenizer_type": entry.tokenizer_type},
+                "seed": body.seed if body.seed is not None else random.randrange(2**31),
+                "count": body.count,
+                "continue_from": body.continue_from.model_dump() if body.continue_from else None,
+            }
+            takes = p.new_takes(body.count, record)
+            runner.submit("generate", pid, [t["id"] for t in takes])
+            return detail(p)
 
     def find_take(p: Project, tid: str) -> dict:
         try:
@@ -430,17 +441,21 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     @app.patch("/api/projects/{pid}/takes/{tid}")
     def update_take(pid: str, tid: str, body: TakePatch):
-        p = open_project(pid)
-        find_take(p, tid)
-        return p.update_take(tid, **body.model_dump(exclude_none=True))
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            find_take(p, tid)
+            return p.update_take(tid, **body.model_dump(exclude_none=True))
 
     @app.delete("/api/projects/{pid}/takes/{tid}", status_code=204)
     def delete_take(pid: str, tid: str):
-        p = open_project(pid)
-        find_take(p, tid)
-        if any(tid in j.takes for j in runner.active_for(pid)):
-            raise HTTPException(409, "生成中・待ちのテイクは先に止めてください")
-        p.delete_take(tid)
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            find_take(p, tid)
+            if any(tid in j.takes for j in runner.active_for(pid)) or any(
+                j.kind == "style" for j in runner.active_for("")
+            ):
+                raise HTTPException(409, "生成中・待ち、または好みの学習中のテイクは先に処理を止めてください")
+            p.delete_take(tid)
 
     def expected_take_midi_end(p: Project, take: dict) -> float | None:
         expected = float(take.get("duration") or 0.0)
@@ -497,22 +512,23 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
     @app.post("/api/projects/{pid}/takes/{tid}/score")
     def score_take(pid: str, tid: str, body: ScoreIn):
         """テイクを楽譜 (MusicXML) にするジョブを始める。原曲の拍 (SheetSage2-Refined) が要るので音源のあるプロジェクトだけ"""
-        p = open_project(pid)
-        take = find_take(p, tid)
-        if take["state"] != "done":
-            raise HTTPException(400, "生成が終わったテイクだけを楽譜にできます")
-        if p.audio_path is None and not (p.dir / "sheetsage.json").is_file():
-            raise HTTPException(400, "楽譜にするには原曲の拍が要ります。音源のあるプロジェクトで使ってください")
-        if any(j.kind == "score" and tid in j.takes for j in runner.active_for(pid)):
-            raise HTTPException(409, "このテイクは楽譜にしているところです")
-        try:
-            entry = engine.score_entry(body.model)
-        except ValueError as e:
-            raise HTTPException(400, str(e)) from e
-        score = {"state": "queued", "error": None, "model": {"id": entry.id, "label": entry.label}}
-        p.update_take(tid, score={**(take.get("score") or {}), **score})
-        runner.submit("score", pid, [tid])
-        return detail(p)
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            take = find_take(p, tid)
+            if take["state"] != "done":
+                raise HTTPException(400, "生成が終わったテイクだけを楽譜にできます")
+            if p.audio_path is None and not (p.dir / "sheetsage.json").is_file():
+                raise HTTPException(400, "楽譜にするには原曲の拍が要ります。音源のあるプロジェクトで使ってください")
+            if any(j.kind == "score" and tid in j.takes for j in runner.active_for(pid)):
+                raise HTTPException(409, "このテイクは楽譜にしているところです")
+            try:
+                entry = engine.score_entry(body.model)
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from e
+            score = {"state": "queued", "error": None, "model": {"id": entry.id, "label": entry.label}}
+            p.update_take(tid, score={**(take.get("score") or {}), **score})
+            runner.submit("score", pid, [tid])
+            return detail(p)
 
     @app.get("/api/projects/{pid}/takes/{tid}/score.musicxml")
     def get_take_score(pid: str, tid: str):
@@ -578,28 +594,31 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
     @app.post("/api/styles")
     def create_style(body: StyleIn):
         """今のお気に入り (全曲の、音源のある曲のもの) から、好みのベクトルを学習するジョブを始める"""
-        try:
-            entry = engine.entry(body.model)
-        except ValueError as e:
-            raise HTTPException(400, str(e)) from e
-        favorites = [f for f in favorite_takes() if f["audio"]]
-        if not favorites:
-            raise HTTPException(400, "音源のある曲のお気に入りがありません")
-        # 初期値: このモデルで作ったお気に入りの演奏者 (なければ全部のお気に入りの演奏者) の埋め込みの平均。
-        # 好みで作ったテイクの演奏者の番号は意味がないので数えない
-        numbered = [f for f in favorites if not f["style"]]
-        init = [f["channel"] for f in numbered if f["model"] == entry.id] or [f["channel"] for f in numbered] or [0]
-        if entry.num_channels:
-            init = [c if c < entry.num_channels else 0 for c in init]
-        name = body.name.strip() or f"好み {len(styles.list()) + 1}"
-        style = styles.create(
-            name,
-            {"id": entry.id, "label": entry.label},
-            [{"project": f["project"], "take": f["take"]} for f in favorites],
-            init,
-        )
-        runner.submit("style", "", [style["id"]])
-        return style_view(style)
+        with ExitStack() as stack:
+            for project in sorted(projects(root), key=lambda item: item.id):
+                stack.enter_context(runner.project_lock(project.id))
+            try:
+                entry = engine.entry(body.model)
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from e
+            favorites = [f for f in favorite_takes() if f["audio"]]
+            if not favorites:
+                raise HTTPException(400, "音源のある曲のお気に入りがありません")
+            # 初期値: このモデルで作ったお気に入りの演奏者 (なければ全部のお気に入りの演奏者) の埋め込みの平均。
+            # 好みで作ったテイクの演奏者の番号は意味がないので数えない
+            numbered = [f for f in favorites if not f["style"]]
+            init = [f["channel"] for f in numbered if f["model"] == entry.id] or [f["channel"] for f in numbered] or [0]
+            if entry.num_channels:
+                init = [c if c < entry.num_channels else 0 for c in init]
+            name = body.name.strip() or f"好み {len(styles.list()) + 1}"
+            style = styles.create(
+                name,
+                {"id": entry.id, "label": entry.label},
+                [{"project": f["project"], "take": f["take"]} for f in favorites],
+                init,
+            )
+            runner.submit("style", "", [style["id"]])
+            return style_view(style)
 
     def find_style(sid: str) -> dict:
         try:

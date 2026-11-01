@@ -26,6 +26,7 @@ export type ModelEntry = {
   spec: string;
   planner: string | null;
   num_channels: number | null;
+  tokenizer_type?: "time" | "beat" | null;
 };
 
 // cover_studio/app.py の API_VERSION と同じにする (違えばサーバが古い)
@@ -72,7 +73,7 @@ export type Take = {
   duration: number | null;
   notes: number | null;
   params: Params;
-  model: { id: string; label: string };
+  model: { id: string; label: string; tokenizer_type?: "time" | "beat" | null };
   seed: number;
   count: number;
   continue_from: ContinueFrom | null;

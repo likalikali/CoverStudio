@@ -34,7 +34,7 @@ export function TakeCard(props: CardProps) {
   const t = useT();
   const active = take.state === "queued" || take.state === "running";
   const styleName = useStyleName();
-  const chips = diffChips(take.params, props.defaults, t, styleName);
+  const chips = diffChips(take.params, props.defaults, t, styleName, take.model.tokenizer_type);
   return (
     <div
       className={`take ${props.selected ? "selected" : ""} ${take.state}`}

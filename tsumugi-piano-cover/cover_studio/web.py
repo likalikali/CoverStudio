@@ -21,7 +21,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
-WEB_DIST_URL = "https://github.com/anime-song/tsumugi-piano-cover/releases/download/web-latest/web-dist.zip"
+WEB_DIST_URL = "https://github.com/likalikali/CoverStudio/releases/download/web-latest/web-dist.zip"
 
 
 def has_web(dest: Path = STATIC_DIR) -> bool:
