@@ -1,0 +1,458 @@
+// 原曲の音源とカバー (ピアノの音源で鳴らす) を同じ時計で再生する。
+// カバーは原曲の時間軸の上に生成しているので、同じ秒で並べればそのまま重なる。
+// テイクを切り替えても再生位置はそのままなので、同じ所を聴き比べられる。
+import { CacheStorage, Scheduler, SplendidGrandPiano, audioBufferToWav16, renderOffline, type Smplr } from "smplr";
+import type { CoverNote } from "./api";
+
+const LOOKAHEAD = 0.3; // 何秒先までの音を予約するか
+const TICK_MS = 25;
+const PIANO_LOAD_TIMEOUT_MS = 8_000;
+const PIANO_CACHE_NAME = "cover-studio-piano-v2";
+
+export type PianoState = "loading" | "ready" | "fallback";
+
+export class Player {
+  readonly ctx: AudioContext;
+  private originalGain: GainNode;
+  private coverGain: GainNode;
+  private piano: Smplr | null = null;
+  pianoState: PianoState = "loading";
+  pianoProgress = 0;
+
+  original: AudioBuffer | null = null;
+  originalUrl: string | null = null;
+  originalLoading = false;
+  private originalSource: AudioBufferSourceNode | null = null;
+
+  notes: CoverNote[] = [];
+  private notesEnd = 0;
+  private nextIndex = 0;
+  private fallbackVoices = new Set<OscillatorNode>();
+  private fallbackWave: PeriodicWave;
+  private pianoLoadTimer: number | null = null;
+
+  playing = false;
+  private anchorCtx = 0;
+  private anchorPos = 0;
+  private pausedPos = 0;
+  private timer: number | null = null;
+
+  loop: [number, number] | null = null;
+  loopOn = false;
+  mix = 0.5; // 0 = 原曲だけ、1 = カバーだけ
+  private extraDuration = 0;
+
+  private listeners = new Set<() => void>();
+  version = 0;
+
+  constructor() {
+    this.ctx = new AudioContext({ latencyHint: "interactive" });
+    this.originalGain = this.ctx.createGain();
+    this.coverGain = this.ctx.createGain();
+    this.originalGain.connect(this.ctx.destination);
+    this.coverGain.connect(this.ctx.destination);
+    this.fallbackWave = createPianoWave(this.ctx);
+    this.setMix(this.mix);
+    this.loadPiano();
+  }
+
+  private loadPiano() {
+    try {
+      const piano = SplendidGrandPiano(this.ctx, {
+        destination: this.coverGain,
+        storage: new CacheStorage(PIANO_CACHE_NAME),
+        onLoadProgress: (p) => {
+          this.pianoProgress = p.total ? p.loaded / p.total : 0;
+          this.emit();
+        },
+      });
+      this.piano = piano;
+      // Some sample hosts never reject a stalled request. Keep the synth active
+      // immediately, and stop showing "loading" after a bounded wait.
+      this.pianoLoadTimer = window.setTimeout(() => {
+        this.pianoLoadTimer = null;
+        if (this.pianoState === "loading") {
+          this.pianoState = "fallback";
+          this.emit();
+        }
+      }, PIANO_LOAD_TIMEOUT_MS);
+      piano.ready.then(
+        () => {
+          if (this.pianoLoadTimer != null) window.clearTimeout(this.pianoLoadTimer);
+          this.pianoLoadTimer = null;
+          this.pianoState = "ready";
+          this.emit();
+        },
+        (e) => this.useFallback(e),
+      );
+    } catch (e) {
+      this.useFallback(e);
+    }
+  }
+
+  private useFallback(reason: unknown) {
+    console.warn("ピアノ音源を読めませんでした。WebAudio 合成音に切り替えます", reason);
+    if (this.pianoLoadTimer != null) window.clearTimeout(this.pianoLoadTimer);
+    this.pianoLoadTimer = null;
+    this.piano = null;
+    this.pianoState = "fallback";
+    this.emit();
+  }
+
+  // ------------------------------------------------------------ 購読
+  subscribe = (listener: () => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+  getVersion = () => this.version;
+  private emit() {
+    this.version++;
+    for (const l of this.listeners) l();
+  }
+
+  // ------------------------------------------------------------ 中身
+  async setOriginal(url: string | null) {
+    if (url === this.originalUrl) return;
+    const wasPlaying = this.playing;
+    const pos = this.position();
+    if (wasPlaying) this.pause();
+    this.originalUrl = url;
+    this.original = null;
+    this.emit();
+    if (!url) return;
+    this.originalLoading = true;
+    this.emit();
+    try {
+      const res = await fetch(url);
+      const buffer = await this.ctx.decodeAudioData(await res.arrayBuffer());
+      if (this.originalUrl === url) this.original = buffer;
+    } catch (e) {
+      console.warn("音源を読めませんでした", e);
+    } finally {
+      if (this.originalUrl === url) this.originalLoading = false;
+      this.emit();
+    }
+    if (wasPlaying && this.originalUrl === url) this.play(pos);
+  }
+
+  setNotes(notes: CoverNote[]) {
+    if (notes === this.notes) return;
+    const sorted = [...notes].sort((a, b) => a[0] - b[0]);
+    this.notesEnd = sorted.reduce((m, n) => Math.max(m, n[4]), 0);
+    if (this.playing) {
+      const pos = this.position();
+      this.stopSound();
+      this.notes = sorted;
+      this.start(pos);
+    } else {
+      this.notes = sorted;
+    }
+    this.emit();
+  }
+
+  /** 原曲もカバーもないときに、ピアノロールで見せている長さ (原曲の MIDI など) */
+  setExtraDuration(seconds: number) {
+    this.extraDuration = seconds;
+    this.emit();
+  }
+
+  get duration(): number {
+    return Math.max(this.original?.duration ?? 0, this.notesEnd, this.extraDuration);
+  }
+
+  position(): number {
+    if (!this.playing) return this.pausedPos;
+    return Math.max(0, this.anchorPos + (this.ctx.currentTime - this.anchorCtx));
+  }
+
+  // ------------------------------------------------------------ 操作
+  play(from?: number) {
+    if (this.playing) this.stopSound();
+    void this.ctx.resume();
+    let pos = from ?? this.pausedPos;
+    if (pos >= this.duration - 0.05) pos = this.loopOn && this.loop ? this.loop[0] : 0;
+    this.start(pos);
+    this.emit();
+  }
+
+  pause() {
+    if (!this.playing) return;
+    this.pausedPos = this.position();
+    this.stopSound();
+    this.playing = false;
+    this.emit();
+  }
+
+  toggle() {
+    if (this.playing) this.pause();
+    else this.play();
+  }
+
+  seek(pos: number) {
+    pos = Math.max(0, Math.min(pos, this.duration));
+    if (this.playing) {
+      this.stopSound();
+      this.start(pos);
+    } else {
+      this.pausedPos = pos;
+    }
+    this.emit();
+  }
+
+  setMix(mix: number) {
+    this.mix = mix;
+    const t = this.ctx.currentTime;
+    this.originalGain.gain.setTargetAtTime(Math.min(1, 2 * (1 - mix)), t, 0.02);
+    this.coverGain.gain.setTargetAtTime(Math.min(1, 2 * mix), t, 0.02);
+    this.emit();
+  }
+
+  setLoop(loop: [number, number] | null) {
+    this.loop = loop;
+    this.loopOn = loop != null;
+    this.emit();
+  }
+
+  toggleLoop() {
+    if (!this.loop) return;
+    this.loopOn = !this.loopOn;
+    this.emit();
+  }
+
+  // ------------------------------------------------------------ 予約
+  private start(pos: number) {
+    this.playing = true;
+    this.anchorCtx = this.ctx.currentTime + 0.05;
+    this.anchorPos = pos;
+    if (this.original && pos < this.original.duration) {
+      const source = this.ctx.createBufferSource();
+      source.buffer = this.original;
+      source.connect(this.originalGain);
+      source.start(this.anchorCtx, pos);
+      this.originalSource = source;
+    }
+    this.nextIndex = lowerBound(this.notes, pos);
+    this.timer = window.setInterval(this.tick, TICK_MS);
+    this.tick();
+  }
+
+  private stopSound() {
+    if (this.timer != null) window.clearInterval(this.timer);
+    this.timer = null;
+    if (this.originalSource) {
+      try {
+        this.originalSource.stop();
+      } catch {
+        // まだ始まっていない
+      }
+      this.originalSource.disconnect();
+      this.originalSource = null;
+    }
+    this.piano?.stop();
+    for (const osc of this.fallbackVoices) {
+      try {
+        osc.stop();
+      } catch {
+        // すでに止まっている
+      }
+    }
+    this.fallbackVoices.clear();
+  }
+
+  private tick = () => {
+    const pos = this.position();
+    if (this.loopOn && this.loop && pos >= this.loop[1]) {
+      this.stopSound();
+      this.start(this.loop[0]);
+      return;
+    }
+    if (pos >= this.duration + 0.3) {
+      this.stopSound();
+      this.playing = false;
+      this.pausedPos = 0;
+      this.emit();
+      return;
+    }
+    const horizon = pos + LOOKAHEAD;
+    const loopEnd = this.loopOn && this.loop ? this.loop[1] : Infinity;
+    const now = this.ctx.currentTime;
+    while (this.nextIndex < this.notes.length && this.notes[this.nextIndex][0] < horizon) {
+      const note = this.notes[this.nextIndex++];
+      if (note[0] >= loopEnd) continue;
+      const when = this.anchorCtx + (note[0] - this.anchorPos);
+      if (when < now - 0.03) continue;
+      this.playNote(note, Math.max(when, now));
+    }
+  };
+
+  private playNote(note: CoverNote, when: number) {
+    const duration = Math.max(0.05, note[4] - note[0]);
+    if (this.piano && this.pianoState === "ready") {
+      try {
+        this.piano.start({ note: note[2], velocity: note[3], time: when, duration });
+        return;
+      } catch (e) {
+        this.useFallback(e);
+      }
+    }
+
+    // Do not drop notes while the remote sample bank is loading. The synth is
+    // intentionally available from the first click, even when every sample URL
+    // is stalled or the browser is offline.
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.setPeriodicWave(this.fallbackWave);
+    osc.frequency.setValueAtTime(440 * Math.pow(2, (note[2] - 69) / 12), when);
+    const velocity = Math.max(0.02, Math.min(1, note[3] / 127));
+    const peak = 0.16 * Math.pow(velocity, 1.35);
+    gain.gain.setValueAtTime(0.0001, when);
+    gain.gain.linearRampToValueAtTime(peak, when + 0.006);
+    gain.gain.setTargetAtTime(peak * 0.32, when + 0.006, 0.11);
+    gain.gain.setTargetAtTime(0.0001, when + duration, 0.08);
+    osc.connect(gain).connect(this.coverGain);
+    osc.start(when);
+    osc.stop(when + duration + 0.55);
+    this.fallbackVoices.add(osc);
+    osc.onended = () => {
+      this.fallbackVoices.delete(osc);
+      osc.disconnect();
+      gain.disconnect();
+    };
+  }
+}
+
+function lowerBound(notes: CoverNote[], time: number): number {
+  let lo = 0;
+  let hi = notes.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (notes[mid][0] < time) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+let instance: Player | null = null;
+export function getPlayer(): Player {
+  if (!instance) {
+    instance = new Player();
+    // 紹介動画の録画用 (URL に ?record を付けたときだけ)。外から再生位置を決めて 1 コマずつ撮り、音は別に書き出す
+    if (new URLSearchParams(window.location.search).has("record")) {
+      (window as unknown as { coverStudio: object }).coverStudio = {
+        player: instance,
+        // start〜end 秒だけを 16 bit の WAV にして base64 で返す (全曲だと受け渡しが重い)
+        renderWav: async (start: number, end: number) => {
+          const full = (await renderCover(instance!.notes)).audioBuffer;
+          const from = Math.floor(start * full.sampleRate);
+          const length = Math.min(full.length, Math.floor(end * full.sampleRate)) - from;
+          const part = new AudioBuffer({ length, numberOfChannels: full.numberOfChannels, sampleRate: full.sampleRate });
+          for (let c = 0; c < full.numberOfChannels; c++) {
+            part.copyToChannel(full.getChannelData(c).subarray(from, from + length), c);
+          }
+          return blobToBase64(audioBufferToWav16(part));
+        },
+      };
+    }
+  }
+  return instance;
+}
+
+function createPianoWave(ctx: BaseAudioContext): PeriodicWave {
+  // A small inharmonic-ish harmonic stack: brighter hammer attack, fast decay,
+  // and a softer sustain than a plain triangle oscillator.
+  const real = new Float32Array(8);
+  const imag = new Float32Array(8);
+  imag[1] = 1.0;
+  imag[2] = 0.30;
+  imag[3] = 0.12;
+  imag[4] = 0.055;
+  imag[5] = 0.025;
+  imag[6] = 0.012;
+  imag[7] = 0.006;
+  return ctx.createPeriodicWave(real, imag);
+}
+
+function scheduleFallbackNote(
+  ctx: BaseAudioContext,
+  destination: AudioNode,
+  wave: PeriodicWave,
+  note: CoverNote,
+  when: number,
+  duration: number,
+): OscillatorNode {
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.setPeriodicWave(wave);
+  osc.frequency.setValueAtTime(440 * Math.pow(2, (note[2] - 69) / 12), when);
+  const velocity = Math.max(0.02, Math.min(1, note[3] / 127));
+  const peak = 0.16 * Math.pow(velocity, 1.35);
+  gain.gain.setValueAtTime(0.0001, when);
+  gain.gain.linearRampToValueAtTime(peak, when + 0.006);
+  gain.gain.setTargetAtTime(peak * 0.32, when + 0.006, 0.11);
+  gain.gain.setTargetAtTime(0.0001, when + duration, 0.08);
+  osc.connect(gain).connect(destination);
+  osc.start(when);
+  osc.stop(when + duration + 0.55);
+  osc.onended = () => {
+    osc.disconnect();
+    gain.disconnect();
+  };
+  return osc;
+}
+
+async function renderCover(notes: CoverNote[]) {
+  const end = notes.reduce((m, n) => Math.max(m, n[4]), 0);
+  const result = await renderOffline(
+    async (ctx) => {
+      // smplr は既定では 200ms より先の音をタイマーで順に流すが、オフラインの書き出しは実時間より速く進むので
+      // タイマーが追いつかずに音が抜ける。曲の長さ全体を先読みにして、すべての音をその場で予約する
+      const scheduler = Scheduler(ctx, { lookaheadMs: (end + 10) * 1000 });
+      const piano = SplendidGrandPiano(ctx, { storage: new CacheStorage(PIANO_CACHE_NAME), scheduler });
+      let timeoutId: number | undefined;
+      const samplesReady = await Promise.race([
+        piano.ready.then(() => true, () => false),
+        new Promise<boolean>((resolve) => {
+          timeoutId = window.setTimeout(() => resolve(false), PIANO_LOAD_TIMEOUT_MS);
+        }),
+      ]);
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+      if (samplesReady) {
+        for (const n of notes) {
+          piano.start({ note: n[2], velocity: n[3], time: n[0], duration: Math.max(0.05, n[4] - n[0]) });
+        }
+      } else {
+        const wave = createPianoWave(ctx);
+        for (const n of notes) {
+          scheduleFallbackNote(ctx, ctx.destination, wave, n, n[0], Math.max(0.05, n[4] - n[0]));
+        }
+      }
+    },
+    { duration: end + 2, sampleRate: 44100 },
+  );
+  // 音が重なると 0 dB を超えて 16 bit の WAV で音割れするので、ピークが -1 dB に収まるよう全体を下げる
+  const buffer = result.audioBuffer;
+  let peak = 0;
+  for (let c = 0; c < buffer.numberOfChannels; c++) {
+    for (const v of buffer.getChannelData(c)) peak = Math.max(peak, Math.abs(v));
+  }
+  const limit = 0.89;
+  if (peak > limit) {
+    for (let c = 0; c < buffer.numberOfChannels; c++) {
+      const data = buffer.getChannelData(c);
+      for (let i = 0; i < data.length; i++) data[i] *= limit / peak;
+    }
+  }
+  return result;
+}
+
+async function blobToBase64(blob: Blob): Promise<string> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let text = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) text += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(text);
+}
+
+/** カバーをピアノの音源で WAV に書き出す (ブラウザの中で、実時間より速く作る) */
+export async function downloadCoverWav(notes: CoverNote[], filename: string) {
+  (await renderCover(notes)).downloadWav16(filename);
+}

@@ -1,0 +1,208 @@
+"""学習したモデルを推論用の重みとして保存し、読み込む。Hugging Face の model repository からも読める。
+
+推論用のフォルダ:
+    config.json         モデルの種類 (model_type) と設定 (model_config / tokenizer_config / 生成で見る文脈の長さなど)
+    model.safetensors   重みだけ (optimizer の状態・学習の設定・演奏者の一覧は入れない)
+
+1 つの repository に piano_ar/ と piano_cover/ を並べて置き、subfolder で選ぶ。直下にも config.json (repository の
+版と中身の一覧、REPO_CONFIG) を置く。Hugging Face はダウンロード数を直下の config.json への問い合わせで数えるので、
+repository から読むときは毎回それも取ってくる (subfolder の config.json は数えられない)。
+手元のフォルダ (export の出力) を渡せば、ネットにはつながずにそれを読む。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import random
+from pathlib import Path
+
+import torch
+from torch import nn
+
+# 公開した版。HF_REPO (from_pretrained の既定) は新しい版
+HF_REPO_V1 = "anime-song/tsumugi-piano-cover"  # 時刻のトークン、tsumugi の採譜だけを見る
+HF_REPO_V2 = "anime-song/tsumugi-piano-cover-v2"  # 拍のトークン、SheetSage2-Refined の拍・メロディと音声の特徴も見る
+HF_REPO = HF_REPO_V2
+HF_REPOS = (HF_REPO_V2, HF_REPO_V1)
+CONFIG_NAME = "config.json"
+WEIGHTS_NAME = "model.safetensors"
+FORMAT_VERSION = 1
+# 公開用の演奏者の番号 → 学習時の番号 (data/metadata/ は gitignore 下)
+CHANNEL_ORDER = Path("data/metadata/public_channel_order.json")
+
+
+def save_pretrained(model: nn.Module, out_dir: str | Path, config: dict) -> Path:
+    from safetensors.torch import save_model
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    # save_model は重みを共有している層もそのまま保存できる (save_file は共有があると失敗する)
+    save_model(model, str(out / WEIGHTS_NAME))
+    config = {"format_version": FORMAT_VERSION, **config}
+    (out / CONFIG_NAME).write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return out
+
+
+def save_repo_config(repo_dir: str | Path, version: int, folders: dict[str, str]) -> Path:
+    """repository の直下の config.json (版と中身の一覧)。ダウンロード数を数えるのに使われる"""
+    path = Path(repo_dir) / CONFIG_NAME
+    config = {"model_type": "tsumugi-piano-cover", "version": version, "folders": folders}
+    path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _count_download(repo_id: str, revision: str | None) -> None:
+    """直下の config.json を取ってくる (Hugging Face のダウンロード数に数えられる)。ないときやつながらないときは何もしない"""
+    from huggingface_hub import hf_hub_download
+
+    try:
+        hf_hub_download(repo_id, CONFIG_NAME, revision=revision)
+    except Exception:  # noqa: BLE001, S110  数えるためだけなので、失敗しても読み込みは続ける
+        pass
+
+
+def shuffle_channels(embedding: nn.Embedding, order_path: str | Path = CHANNEL_ORDER) -> None:
+    """演奏者の埋め込みの行を公開用の番号の順に並べ替える (0 = 指定なし はそのまま)。
+
+    学習時の番号は channel_index.json の追加順で、古い一覧が git の履歴に残っているので、そのまま公開すると
+    番号からチャンネルが分かる。並べ替えの表 (公開番号 → 学習時の番号) は order_path に置いて公開しない。
+    なければ作り、あれば使い回すので、piano_ar と piano_cover で同じ番号が同じ演奏者を指す。
+    """
+    path = Path(order_path)
+    num_channels = embedding.num_embeddings
+    if path.exists():
+        order = json.loads(path.read_text(encoding="utf-8"))
+        if len(order) != num_channels:
+            raise ValueError(f"{path} は演奏者 {len(order) - 1} 人分ですが、モデルは {num_channels - 1} 人分です")
+    else:
+        rest = list(range(1, num_channels))
+        random.SystemRandom().shuffle(rest)
+        order = [0, *rest]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(order) + "\n", encoding="utf-8")
+    with torch.no_grad():
+        embedding.weight.copy_(embedding.weight[torch.tensor(order)])
+
+
+def resolve_pretrained(name_or_path: str | Path, subfolder: str | None = None, revision: str | None = None) -> Path:
+    """config.json のあるフォルダを返す。手元にあればそれ (subfolder の下、なければそのもの)、
+    なければ Hugging Face の repository から subfolder の分だけ取ってくる (2 回目からはキャッシュを使う)"""
+    local = Path(name_or_path)
+    for candidate in ([local / subfolder] if subfolder else []) + [local]:
+        if (candidate / CONFIG_NAME).is_file():
+            return candidate
+    if local.exists():
+        raise FileNotFoundError(f"{local} に {CONFIG_NAME} がありません")
+
+    from huggingface_hub import snapshot_download
+
+    patterns = [f"{subfolder}/*"] if subfolder else None
+
+    def complete(folder: Path) -> bool:
+        return (folder / CONFIG_NAME).is_file() and (folder / WEIGHTS_NAME).is_file()
+
+    # A complete HF snapshot should be usable without any HEAD/ETag request.
+    # This matters on networks where the model is cached but Hub metadata calls
+    # stall. Only a cache miss/incomplete snapshot falls through to the network.
+    try:
+        cached_root = Path(
+            snapshot_download(
+                str(name_or_path),
+                revision=revision,
+                allow_patterns=patterns,
+                local_files_only=True,
+            )
+        )
+        cached_path = cached_root / subfolder if subfolder else cached_root
+        if complete(cached_path):
+            return cached_path
+    except Exception:
+        pass
+
+    # Counting downloads is optional and intentionally disabled by default:
+    # it adds a needless online request before every model load.
+    if os.environ.get("TSUMUGI_COUNT_HF_DOWNLOADS") == "1":
+        _count_download(str(name_or_path), revision)
+
+    root = Path(snapshot_download(str(name_or_path), revision=revision, allow_patterns=patterns))
+    path = root / subfolder if subfolder else root
+    if not complete(path):
+        raise FileNotFoundError(
+            f"{name_or_path} の {subfolder or '(直下)'} に {CONFIG_NAME} / {WEIGHTS_NAME} がありません"
+        )
+    return path
+
+
+def read_config(path: Path, model_type: str) -> dict:
+    config = json.loads((path / CONFIG_NAME).read_text(encoding="utf-8"))
+    if config.get("model_type") != model_type:
+        raise ValueError(f"{path} は {config.get('model_type')} のモデルです ({model_type} を読もうとしました)")
+    return config
+
+
+def load_weights(model: nn.Module, path: Path) -> None:
+    from safetensors.torch import load_model
+
+    load_model(model, str(path / WEIGHTS_NAME), strict=True)
+
+
+def make_tokenizer(tokenizer_config: dict, tokenizer_type: str | None = None):
+    """保存した設定からトークナイザーを作る。tokenizer_type が "beat" なら拍のトークン (piano_ar.beat_tokenizer)"""
+    if tokenizer_type == "beat":
+        from .beat_tokenizer import BeatTokenizer
+        from .config import BeatTokenizerConfig
+
+        return BeatTokenizer(BeatTokenizerConfig(**tokenizer_config))
+    from .config import TokenizerConfig
+    from .tokenizer import PianoTokenizer
+
+    return PianoTokenizer(TokenizerConfig(**tokenizer_config))
+
+
+def load_pretrained_ar(
+    name_or_path: str | Path = HF_REPO,
+    *,
+    subfolder: str | None = "piano_ar",
+    revision: str | None = None,
+    device: str | torch.device = "cpu",
+):
+    """PianoARModel.from_pretrained の中身。model.tokenizer と model.context_patches も付けて返す"""
+    from .config import ModelConfig
+    from .model import PianoARModel
+
+    path = resolve_pretrained(name_or_path, subfolder, revision)
+    config = read_config(path, "piano_ar")
+    tokenizer = make_tokenizer(config["tokenizer_config"], config.get("tokenizer_type"))
+    model = PianoARModel(ModelConfig.from_dict(config["model_config"]), tokenizer)
+    load_weights(model, path)
+    model.tokenizer = tokenizer
+    model.context_patches = int(config["context_patches"])
+    return model.to(device).eval()
+
+
+def load_ar_checkpoint(checkpoint_path: str | Path, device: str | torch.device = "cpu"):
+    """学習のチェックポイント (.pt) を from_pretrained と同じ形で読む"""
+    from .config import ModelConfig
+    from .model import PianoARModel
+    from .train import context_patches
+
+    # optimizer の状態 (モデルの 2 倍の大きさ) も入っているので、mmap で必要な分だけ読む
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
+    tokenizer_type = checkpoint.get("tokenizer_type")
+    tokenizer = make_tokenizer(checkpoint["tokenizer_config"], tokenizer_type)
+    model = PianoARModel(ModelConfig.from_dict(checkpoint["model_config"]), tokenizer)
+    model.load_state_dict(checkpoint["model"])
+    model.tokenizer = tokenizer
+    if tokenizer_type == "beat":  # 文脈は小節の数 (学習の窓 + 記憶)
+        model.context_patches = int(checkpoint["args"]["window_bars"] + checkpoint["args"]["memory_bars"])
+    else:
+        model.context_patches = context_patches(checkpoint["args"], tokenizer.config.patch_seconds)
+    return model.to(device).eval()
+
+
+def load_ar(name_or_path: str | Path, device: str | torch.device = "cpu", subfolder: str | None = "piano_ar"):
+    """.pt なら学習のチェックポイント、それ以外は推論用のフォルダか Hugging Face の repository"""
+    if str(name_or_path).endswith(".pt"):
+        return load_ar_checkpoint(name_or_path, device)
+    return load_pretrained_ar(name_or_path, subfolder=subfolder, device=device)

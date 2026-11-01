@@ -1,0 +1,215 @@
+    # MERT_ROLLBACK_PIPELINE: restore independent SheetSage and frame extraction.
+    _MERT_PIPELINE = "mert_separate_v1"
+
+    def _needs_sheet_sage_compute(self, project: Project, model) -> bool:
+        """Whether the original, separate analysis passes need to run.
+
+        A frame cache from the earlier fused-MERT patch is *not* reused: its
+        old SHA1-only metadata cannot distinguish the different computation path.
+        """
+        audio = project.audio_path
+        if audio is None or not audio.is_file() or not project.has_source:
+            return False
+
+        sha1 = project.data.get("audio_sha1")
+        annotation_path = project.dir / "sheetsage.json"
+        annotation_valid = False
+        if annotation_path.is_file():
+            try:
+                annotated = json.loads(annotation_path.read_text(encoding="utf-8"))
+                annotation_valid = (
+                    annotated.get("audio_sha1") == sha1
+                    and annotated.get("analysis_pipeline") == self._MERT_PIPELINE
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                annotation_valid = False
+
+        source = project.data.get("source") or {}
+        beats_valid = (
+            source.get("beats") == "sheetsage"
+            and source.get("beats_audio_sha1") == sha1
+            and source.get("beats_map") == BEATS_MAP
+        )
+        from piano_ar.beat_tokenizer import BeatTokenizer
+
+        needs_annotation = (
+            not beats_valid
+            or bool(model.config.sheetsage_beats)
+            or bool(model.config.sheetsage_melody)
+            or isinstance(model.tokenizer, BeatTokenizer)
+        )
+        if needs_annotation and not annotation_valid:
+            return True
+
+        if model.config.frame_dims:
+            import hashlib
+
+            pca = Path(getattr(model, "frames_pca_path", None) or self.frames_pca)
+            if not pca.is_file():
+                return True
+            pca_sha1 = hashlib.sha1(pca.read_bytes()).hexdigest()
+            frames_path = project.dir / "frames.npz"
+            if not frames_path.is_file():
+                return True
+            try:
+                with np.load(frames_path) as saved:
+                    if (
+                        str(saved["audio_sha1"]) != str(sha1)
+                        or str(saved["pca_sha1"]) != pca_sha1
+                        or "analysis_pipeline" not in saved.files
+                        or str(saved["analysis_pipeline"]) != self._MERT_PIPELINE
+                    ):
+                        return True
+            except Exception:
+                return True
+        return False
+
+    def _resolve_sheetsage_model(self) -> Path:
+        """Preserve the existing local-first Hugging Face model resolution."""
+        model = self.sheetsage_model
+        if model is None:
+            from sheetsage2_refined.pipeline import DEFAULT_MODEL
+
+            model = DEFAULT_MODEL
+        local = Path(str(model)).expanduser()
+        if local.is_dir():
+            return local.resolve()
+        if local.is_absolute() or local.exists():
+            raise FileNotFoundError(f"SheetSage model folder does not exist: {local}")
+
+        from huggingface_hub import snapshot_download
+
+        try:
+            cached = Path(snapshot_download(str(model), local_files_only=True))
+            if (cached / "config.json").is_file():
+                return cached
+        except Exception:
+            pass
+        downloaded = Path(snapshot_download(str(model)))
+        if not (downloaded / "config.json").is_file():
+            raise FileNotFoundError(f"SheetSage model config.json was not found: {downloaded}")
+        return downloaded
+
+    def _sheetsage(self, project: Project, progress: Callable[[float, str], None], log: Callable[[str], None]) -> Path:
+        """Original SheetSage beat/melody pass, independent from FrameExtractor.
+
+        Recompute annotations from the previous fused-MERT pipeline, keep a
+        backup of the old file, and mark the output as separately computed.
+        """
+        import shutil
+
+        out = project.dir / "sheetsage.json"
+        audio = project.audio_path
+        sha1 = project.data.get("audio_sha1")
+        if out.is_file():
+            try:
+                previous = json.loads(out.read_text(encoding="utf-8"))
+                if (
+                    previous.get("audio_sha1") == sha1
+                    and previous.get("analysis_pipeline") == self._MERT_PIPELINE
+                ):
+                    return out
+            except (OSError, ValueError):
+                pass
+
+        if audio is None or not audio.is_file():
+            raise FileNotFoundError(
+                "このモデルは原曲の音声から拍とメロディを予測して使います。音源のあるプロジェクトで生成してください"
+            )
+        import torch
+
+        from piano_ar.sheetsage import SheetSageAnnotator
+
+        progress(0.0, "beats")
+        log(f"[MERT separate] 原曲の拍とメロディを予測しています: {audio.name}")
+        annotator = SheetSageAnnotator(self._resolve_sheetsage_model(), device=str(self.device))
+        try:
+            # No on_states callback: this is the original annotation algorithm.
+            result = annotator.annotate(audio)
+        finally:
+            del annotator
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        result["audio_sha1"] = sha1
+        result["analysis_pipeline"] = self._MERT_PIPELINE
+        tmp = out.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        try:
+            if out.is_file():
+                backup = project.dir / "sheetsage.before_mert_rollback.json"
+                if not backup.exists():
+                    shutil.copy2(out, backup)
+            tmp.replace(out)
+        finally:
+            tmp.unlink(missing_ok=True)
+        log(f"拍 {len(result['beats'])}・メロディ {len(result['melody'])} 音")
+        return out
+
+    def _frames(self, project: Project, progress: Callable[[float, str], None], log: Callable[[str], None]) -> Path:
+        """Original second, independent MERT forward pass for frame features.
+
+        The previous patch stored fused and original frames using the same
+        audio/PCA SHA1 pair. Reject all unmarked legacy caches once, and write
+        the pipeline marker to keep future runs safe and fast.
+        """
+        import hashlib
+        import shutil
+
+        out = project.dir / "frames.npz"
+        audio = project.audio_path
+        pca = Path(getattr(self._model, "frames_pca_path", None) or self.frames_pca)
+        if not pca.is_file():
+            raise FileNotFoundError(f"原曲の音声の特徴を作る PCA がありません: {pca} (--frames-pca で指定)")
+        sha1 = project.data.get("audio_sha1")
+        pca_sha1 = hashlib.sha1(pca.read_bytes()).hexdigest()
+        if out.is_file():
+            try:
+                with np.load(out) as saved:
+                    if (
+                        str(saved["audio_sha1"]) == str(sha1)
+                        and str(saved["pca_sha1"]) == pca_sha1
+                        and "analysis_pipeline" in saved.files
+                        and str(saved["analysis_pipeline"]) == self._MERT_PIPELINE
+                    ):
+                        return out
+            except Exception:
+                pass
+
+        if audio is None or not audio.is_file():
+            raise FileNotFoundError("このモデルは原曲の音声の特徴を使います。音源のあるプロジェクトで生成してください")
+        import torch
+
+        from piano_cover.audio_frames import FrameExtractor, FrameProjector
+
+        progress(0.0, "beats")
+        log(f"[MERT separate] 原曲の音声の特徴を作っています: {audio.name}")
+        extractor = FrameExtractor(self._resolve_sheetsage_model(), device=str(self.device))
+        try:
+            frames = FrameProjector(extractor, pca)(audio)
+        finally:
+            del extractor
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        tmp = out.with_suffix(".tmp.npz")
+        np.savez(
+            tmp,
+            frames=frames,
+            audio_sha1=np.str_(sha1),
+            pca_sha1=np.str_(pca_sha1),
+            analysis_pipeline=np.str_(self._MERT_PIPELINE),
+        )
+        try:
+            if out.is_file():
+                backup = project.dir / "frames.before_mert_rollback.npz"
+                if not backup.exists():
+                    shutil.copy2(out, backup)
+            tmp.replace(out)
+        finally:
+            tmp.unlink(missing_ok=True)
+        log(f"特徴 {len(frames)} フレーム (原始独立 MERT 推理)")
+        return out
+

@@ -1,0 +1,73 @@
+# Virtual Environments & Upstream Local Runtime
+.venv*
+venv/
+ENV/
+.transkun/
+.tsumugi/
+
+# IDE & WorkBuddy
+.vscode/
+.idea/
+.workbuddy/
+*.swp
+*.swo
+
+# Runtime Cache, User Data & Logs
+Dataset/
+wandb/
+runs/
+cache/
+data/
+logs/
+*.log
+.cover_batch_size
+
+# Backup & Patch Artifacts
+_backup_*/
+*.bak
+*.bak*
+*.orig
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Environment / Secrets
+.env
+.env.*
+*.conf
+
+# Model Checkpoints & Weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+checkpoints/
+pretrained/
+pretrained_v2/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Cover Studio / Tsumugi Outputs & Static Assets
+outputs/
+local/
+projects/
+cover_studio/static/
+**/cover_studio/static/
+node_modules/
+**/node_modules/
+

@@ -1,0 +1,52 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class CoverConfig:
+    """カバーモデルで足す部分 (原曲エンコーダと cross-attention)。デコーダは ModelConfig のまま"""
+
+    # 原曲エンコーダと cross-attention の中の幅。0 ならデコーダと同じ。デコーダを大きくしても足す部分を
+    # 大きくしすぎない (カバーのデータは 150 時間ほどなので過学習しやすい) よう、細くできるようにする。
+    # ヘッドの次元はデコーダと同じにして、ヘッド数を幅に合わせて減らす
+    source_dim: int = 0
+    # 原曲の 1 パッチ (デコーダと同じ 2 秒) の行を K 本の要約にまとめる双方向 Transformer
+    source_patch_layers: int = 2
+    source_latents: int = 4
+    # 全曲の要約列を見る双方向 Transformer
+    source_song_layers: int = 6
+    # 1 パッチに入れる原曲の行 (音・拍・コード・キー) の上限。超えた分は切り捨てる
+    max_source_rows: int = 256
+    # Global / Local の何ブロックごとに cross-attention を挟むか
+    global_cross_every: int = 2
+    local_cross_every: int = 2
+    # Global が見る原曲の範囲 (対応する時刻から ± 何パッチ)
+    global_cross_window: int = 4
+    # Local が見る原曲の音の範囲 (対応するパッチから ± 何パッチ)
+    local_cross_radius: int = 1
+    # 学習できる onset-bias (OnsetHead) の中の幅。原曲の onset の位置を Local の TIME の予測に直接足す。0 で使わない
+    onset_head_dim: int = 32
+    # 原曲の全体から、パッチごとの強弱と音の多さの曲線を予測する Planner の幅と層数 (0 で使わない)。
+    # デコーダの強弱の条件 (ModelConfig.dynamics_bins) と一緒に使う
+    planner_dim: int = 256
+    planner_layers: int = 3
+    # cross-attention の出力のゲート (tanh) の初期値。0 なら学習の始めは事前学習モデルとまったく同じ出力になるが、
+    # ゲートが開くまで cross-attention の中の重みに勾配が流れず、原曲を使い始めるのが遅い (208M のデコーダでは
+    # step 3000 でもゲート 0.004 で、原曲ありとなしの損失の差は 0.017)。重みを読み込むときは保存した値が使われるので、
+    # 学習の始めだけに効く
+    cross_gate_init: float = 0.0
+    # 原曲の音声の特徴 (piano_cover.audio_frames の PCA 後の次元、0 で使わない) と、1 パッチに入れる特徴の行の上限。
+    # 特徴の行は原曲の行と一緒に原曲エンコーダに入り、Local の cross-attention からも見える
+    frame_dims: int = 0
+    max_frame_rows: int = 128
+    # 原曲の行に SheetSage2-Refined の注釈を使って学習したか (キャッシュの meta.json の sheetsage から決まる)。
+    # 生成でも同じ形の行を作る: beats なら拍を SheetSage のものに置き換え、melody ならメロディの音を足す
+    sheetsage_beats: bool = False
+    sheetsage_melody: bool = False
+
+    @classmethod
+    def from_dict(cls, values: dict) -> CoverConfig:
+        """チェックポイントに保存した設定から作る。あとから足した部分 (OnsetHead・Planner) のない以前のチェックポイントは、
+        それらなしとして読む"""
+        return cls(**{"onset_head_dim": 0, "planner_dim": 0, **values})

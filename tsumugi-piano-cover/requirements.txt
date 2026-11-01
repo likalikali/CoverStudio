@@ -1,0 +1,20 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.13.0+cu126
+numpy
+symusic
+mido>=1.3.3
+wandb
+# 学習中の生成サンプルを wandb に送るとき (wandb.Audio と wandb.Image) に要る
+soundfile
+pillow
+# torch.compile 用 (torch 2.13 は triton 3.7 系)
+triton-windows>=3.7,<3.8; sys_platform == "win32"
+# 推論用の重みの読み書き (piano_ar.hub)
+safetensors
+huggingface_hub
+# UI (cover_studio)
+fastapi
+uvicorn
+python-multipart
+# 音声の拍とメロディの注釈 (piano_ar.sheetsage)
+sheetsage2-refined @ git+https://github.com/anime-song/SheetSage2-Refined

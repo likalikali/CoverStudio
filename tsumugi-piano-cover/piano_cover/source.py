@@ -1,0 +1,495 @@
+"""原曲 (tsumugi で採譜した MIDI) を、カバーモデルの原曲エンコーダに入れる形にする。
+
+原曲は「行」の配列 int32 [N, 6] = (onset, type, a, b, c, d) で持つ。時間はデコーダと同じフレーム単位。
+    NOTE : a = pitch (0-127, ドラムは GM の打楽器番号), b = duration, c = velocity, d = 楽器 ID (INSTRUMENTS)
+           d が SHEETSAGE_SUNG / SHEETSAGE_PLAYED なら SheetSage2-Refined のメロディ (歌 / 楽器)
+    BEAT : a = 1 なら小節の頭
+    CHORD: a = root (0-11, 12 はコードなし N), b = 種類 ID (CHORD_QUALITIES), c = ベース音 (0-11, 12 は転回なし)
+    KEY  : a = 主音 (0-11), b = 0 長調 / 1 短調
+時刻は原曲の音声の先頭からの絶対時刻のまま (アラインメントの原曲側の時刻と同じ基準) で、先頭の無音も詰めない。
+
+with_sheetsage で、SheetSage2-Refined (piano_ar.sheetsage) の注釈を足せる。拍は tsumugi のテンポマップのものを捨てて
+SheetSage の拍と小節の頭に置き換え、メロディは tsumugi のメロディとは別の楽器 ID の音として足す。どちらも音声の
+絶対時刻なので、そのまま並べられる (60 曲で拍の差の中央値 -12ms、メロディの onset の差 -9ms)。
+
+エンコーダに入れるときは source_features で 2 秒パッチごとに並べ、各行を埋め込み表の番号 5 個 (種類 + 属性 4 つ) にする。
+パッチの先頭には「その時点で鳴っているコード」と「その時点のキー」の行を足す。キーは曲の途中で変わるので、
+曲全体の条件にはせず、パッチごとに今のキーが分かるようにする。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+from piano_ar.config import TokenizerConfig
+from piano_ar.tokenizer import PianoTokenizer
+
+ROW_ONSET, ROW_TYPE, ROW_A, ROW_B, ROW_C, ROW_D = range(6)
+TYPE_NOTE, TYPE_BEAT, TYPE_CHORD, TYPE_KEY = range(4)
+# パッチの先頭に足す「その時点のコード / キー」(source_features の中でだけ使う)
+TYPE_CHORD_STATE, TYPE_KEY_STATE = 4, 5
+NUM_TYPES = 6
+
+# tsumugi の楽器クラス (instrument_agnostic_amt.taxonomy.instrument_classes) + それ以外
+INSTRUMENTS = (
+    "accordion_family", "acoustic_bass", "acoustic_guitar", "brass", "choir", "chromatic_percussion",
+    "distorted_guitar", "drums", "electric_bass", "electric_guitar_clean", "electric_guitar_muted",
+    "electric_piano", "ethnic", "flute_pipe", "guitar_harmonics", "harmonica", "orchestra_hit",
+    "orchestral_harp", "orchestral_woodwind", "organ", "percussive_fx", "piano", "pizzicato_strings",
+    "plucked_keyboard", "sax", "slap_bass", "sound_fx", "strings", "synth_bass", "synth_fx", "synth_lead",
+    "synth_pad", "timpani", "melody", "vocal_harmony", "wind_chimes", "other",
+)  # fmt: skip
+INSTRUMENT_ID = {name: i for i, name in enumerate(INSTRUMENTS)}
+DRUM_ID = INSTRUMENT_ID["drums"]
+# SheetSage2-Refined のメロディの楽器 ID。tsumugi の楽器の後ろに置き、埋め込みも表の最後に足す (SourceVocab) ので、
+# これを使わない以前の原曲の行とチェックポイントはそのまま読める
+SHEETSAGE_SUNG, SHEETSAGE_PLAYED = len(INSTRUMENTS), len(INSTRUMENTS) + 1
+# 強さが分からないので、埋め込みの番号を決めるための仮の値
+SHEETSAGE_VELOCITY = 96
+
+# tsumugi のコードマーカー ("Ab:add9/C" の ":" と "/" の間) の種類。長三和音は種類なしで書かれるので "maj" にする
+CHORD_QUALITIES = (
+    "N", "maj", "m", "7", "m7", "M7", "sus4", "m7-5", "m7(9)", "add9", "M7(9)", "6", "dim", "dim7", "7(b9)",
+    "aug", "7(b13)", "m7(11)", "7(9)", "5", "7sus4", "m6", "69", "7(b9,b13)", "mM7", "7(#9)", "7(13)",
+    "7(9,13)", "sus2", "madd9", "7-5", "augM7", "7(#9,b13)", "m7(9,11)", "M7(13)", "7(9,#11)", "aug7",
+    "M7(#11)", "m69", "mM7(9)", "7(b9,13)", "other",
+)  # fmt: skip
+QUALITY_ID = {name: i for i, name in enumerate(CHORD_QUALITIES)}
+NO_CHORD = 12
+NO_BASS = 12
+
+_NOTE_NAMES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+
+
+def _pitch_class(name: str) -> int:
+    value = _NOTE_NAMES[name[0]]
+    for accidental in name[1:]:
+        value += {"#": 1, "b": -1}[accidental]
+    return value % 12
+
+
+def parse_chord(text: str) -> tuple[int, int, int] | None:
+    """ "Ab:add9/C" -> (root, 種類 ID, ベース音)。読めないものは None"""
+    text = text.strip()
+    if text == "N":
+        return NO_CHORD, QUALITY_ID["N"], NO_BASS
+    main, _, bass = text.partition("/")
+    root_name, _, quality = main.partition(":")
+    try:
+        root = _pitch_class(root_name)
+        bass_pc = _pitch_class(bass) if bass else NO_BASS
+    except (KeyError, IndexError):
+        return None
+    return root, QUALITY_ID.get(quality or "maj", QUALITY_ID["other"]), bass_pc
+
+
+class _TempoMap:
+    """tick -> 秒 (MIDI のテンポ変化を積分する)"""
+
+    def __init__(self, score) -> None:
+        tpq = score.ticks_per_quarter
+        tempos = sorted((int(t.time), float(t.mspq)) for t in score.tempos) or [(0, 500_000.0)]
+        if tempos[0][0] > 0:
+            tempos.insert(0, (0, 500_000.0))
+        self.ticks = np.array([t for t, _ in tempos], dtype=np.float64)
+        self.seconds_per_tick = np.array([m for _, m in tempos], dtype=np.float64) / 1e6 / tpq
+        self.start_seconds = np.concatenate([[0.0], np.cumsum(np.diff(self.ticks) * self.seconds_per_tick[:-1])])
+
+    def __call__(self, ticks: np.ndarray) -> np.ndarray:
+        index = np.searchsorted(self.ticks, ticks, side="right") - 1
+        return self.start_seconds[index] + (ticks - self.ticks[index]) * self.seconds_per_tick[index]
+
+
+def _beat_rows(score, frame_rate: int) -> list[list[int]]:
+    """拍子記号とテンポマップから拍と小節の頭を作る。tsumugi は推定した拍が MIDI の拍に乗るよう
+    テンポマップと拍子を書き出すので、MIDI の拍をそのまま使う。拍の推定をしていない (拍子記号がない) 曲は拍なし"""
+    signatures = sorted((int(t.time), t.numerator, t.denominator) for t in score.time_signatures)
+    if not signatures:
+        return []
+    tempo_map = _TempoMap(score)
+    end_tick = int(score.end())
+    beat_ticks, downbeats = [], []
+    for i, (start, numerator, denominator) in enumerate(signatures):
+        stop = signatures[i + 1][0] if i + 1 < len(signatures) else end_tick
+        step = score.ticks_per_quarter * 4 / denominator
+        count = max(0, int(np.ceil((stop - start) / step - 1e-6)))
+        ticks = start + np.arange(count) * step
+        beat_ticks.append(ticks)
+        downbeats.append(np.arange(count) % max(numerator, 1) == 0)
+    if not beat_ticks:
+        return []
+    frames = np.round(tempo_map(np.concatenate(beat_ticks)) * frame_rate).astype(np.int64)
+    flags = np.concatenate(downbeats)
+    return [[int(f), TYPE_BEAT, int(d), 0, 0, 0] for f, d in zip(frames, flags)]
+
+
+def load_source(path: str | Path, frame_rate: int) -> tuple[np.ndarray, int]:
+    """tsumugi の MIDI を行の配列にして、曲の終端フレームと一緒に返す"""
+    from symusic import Score
+
+    score_ticks = Score(str(path))
+    score = score_ticks.to("second")
+    rows: list[list[int]] = []
+    end = 0.0
+    for track in score.tracks:
+        name = track.name.strip()
+        instrument = DRUM_ID if track.is_drum else INSTRUMENT_ID.get(name, INSTRUMENT_ID["other"])
+        for n in track.notes:
+            onset = int(round(n.time * frame_rate))
+            duration = max(1, int(round(n.duration * frame_rate)))
+            rows.append([onset, TYPE_NOTE, int(n.pitch), duration, int(np.clip(n.velocity, 1, 127)), instrument])
+            end = max(end, n.time + n.duration)
+    end_frame = int(np.ceil(end * frame_rate)) + 1
+
+    for marker in score.markers:
+        chord = parse_chord(marker.text)
+        if chord is not None:
+            rows.append([int(round(marker.time * frame_rate)), TYPE_CHORD, *chord, 0])
+    for key in score.key_signatures:
+        # key は調号の # の数 (負なら b)。長調の主音は 5 度圏で 7 半音ずつ進む
+        tonic = (7 * int(key.key)) % 12
+        minor = int(key.tonality) == 1
+        rows.append(
+            [int(round(key.time * frame_rate)), TYPE_KEY, (tonic + 9) % 12 if minor else tonic, int(minor), 0, 0]
+        )
+    rows.extend(_beat_rows(score_ticks, frame_rate))
+
+    if not rows:
+        return np.zeros((0, 6), dtype=np.int32), 0
+    array = np.asarray(rows, dtype=np.int64)
+    array = array[array[:, ROW_ONSET] < end_frame]
+    return sort_rows(array).astype(np.int32), end_frame
+
+
+def sheetsage_rows(annotation: dict, frame_rate: int) -> np.ndarray:
+    """SheetSage2-Refined の注釈 (piano_ar.sheetsage の JSON) を行にする: 拍と小節の頭、メロディの音"""
+    rows = []
+    downbeats = {round(float(d) * frame_rate) for d in annotation["downbeats"]}
+    for beat in annotation["beats"]:
+        frame = round(float(beat) * frame_rate)
+        rows.append([frame, TYPE_BEAT, int(frame in downbeats), 0, 0, 0])
+    for note in annotation["melody"]:
+        onset = round(float(note["start"]) * frame_rate)
+        duration = max(1, round(float(note["end"]) * frame_rate) - onset)
+        instrument = SHEETSAGE_SUNG if note["track"] == 0 else SHEETSAGE_PLAYED
+        rows.append([onset, TYPE_NOTE, int(note["pitch"]), duration, SHEETSAGE_VELOCITY, instrument])
+    return np.asarray(rows, dtype=np.int64).reshape(-1, 6)
+
+
+def with_sheetsage(
+    rows: np.ndarray, annotation: dict, frame_rate: int, beats: bool = True, melody: bool = True
+) -> np.ndarray:
+    """tsumugi の行に SheetSage の注釈を足す。beats なら拍を置き換え、melody ならメロディの音を足す"""
+    extra = sheetsage_rows(annotation, frame_rate)
+    rows = rows.astype(np.int64)
+    parts = [rows]
+    if beats:
+        parts = [rows[rows[:, ROW_TYPE] != TYPE_BEAT], extra[extra[:, ROW_TYPE] == TYPE_BEAT]]
+    if melody:
+        parts.append(extra[extra[:, ROW_TYPE] == TYPE_NOTE])
+    return sort_rows(np.concatenate(parts)).astype(np.int32)
+
+
+def is_sheetsage(rows: np.ndarray) -> np.ndarray:
+    """SheetSage のメロディの音の行か"""
+    return (rows[:, ROW_TYPE] == TYPE_NOTE) & (rows[:, ROW_D] >= SHEETSAGE_SUNG)
+
+
+def tsumugi_notes(rows: np.ndarray) -> np.ndarray:
+    """tsumugi で採譜した音の行だけ (SheetSage のメロディを除く)"""
+    return rows[(rows[:, ROW_TYPE] == TYPE_NOTE) & (rows[:, ROW_D] < SHEETSAGE_SUNG)]
+
+
+# 学習できる onset-bias (CoverModel の OnsetHead) で原曲の onset を分ける種類
+ONSET_GROUPS = ("melody", "keys", "guitar", "bass", "other", "kick", "snare", "drums", "beat", "downbeat", "chord")
+_INSTRUMENT_ONSET_GROUP = {
+    "melody": "melody", "vocal_harmony": "melody",
+    "piano": "keys", "electric_piano": "keys", "organ": "keys", "plucked_keyboard": "keys",
+    "chromatic_percussion": "keys", "accordion_family": "keys",
+    "acoustic_guitar": "guitar", "distorted_guitar": "guitar", "electric_guitar_clean": "guitar",
+    "electric_guitar_muted": "guitar", "guitar_harmonics": "guitar",
+    "acoustic_bass": "bass", "electric_bass": "bass", "slap_bass": "bass", "synth_bass": "bass",
+}  # fmt: skip
+_KICK, _SNARE = (35, 36), (37, 38, 39, 40)
+
+
+def onset_group_tables() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """行から onset の種類 (ONSET_GROUPS の番号、-1 は使わない) を引く表。
+
+    返り値は (楽器 -> 種類, ドラムの打楽器番号 -> 種類, 種類の番号 -> 種類)。
+    行の種類が NOTE なら楽器 (ドラムは打楽器番号) で、BEAT は小節の頭かどうか、CHORD はコードの変わり目で分ける"""
+    group = {name: i for i, name in enumerate(ONSET_GROUPS)}
+    instrument = np.array([group[_INSTRUMENT_ONSET_GROUP.get(name, "other")] for name in INSTRUMENTS], dtype=np.int64)
+    # SheetSage のメロディは tsumugi のメロディと同じ種類にする (種類を増やすと以前の OnsetHead が読めない)
+    instrument = np.concatenate([instrument, [group["melody"], group["melody"]]])
+    drum = np.full(128, group["drums"], dtype=np.int64)
+    drum[list(_KICK)] = group["kick"]
+    drum[list(_SNARE)] = group["snare"]
+    row_type = np.full(NUM_TYPES, -1, dtype=np.int64)
+    row_type[TYPE_CHORD] = group["chord"]
+    return instrument, drum, row_type
+
+
+def onset_time_bias(
+    rows: np.ndarray, num_patches: int, patch_frames: int, strength: float, width_frames: float
+) -> np.ndarray:
+    """原曲の onset (全楽器の音と拍) に近いほど大きい値 [num_patches, patch_frames]。
+
+    生成で TIME の logit に足して (PianoARModel.generate の time_bias)、出力の onset を原曲の onset に寄せる。
+    strength * exp(-d^2 / (2 width^2))、d は一番近い原曲の onset までのフレーム数。
+    カバーモデルは原曲のどこを見るかは合っているが、次の onset は自分のリズムで決めていて、
+    テンポが少しずつずれては 8 分音符 1 つ分で戻る。毎回その場で原曲の onset に合わせ直すことで、ずれが溜まらなくなる。
+    """
+    frames = np.arange(num_patches * patch_frames)
+    onsets = np.unique(rows[(rows[:, ROW_TYPE] == TYPE_NOTE) | (rows[:, ROW_TYPE] == TYPE_BEAT), ROW_ONSET])
+    if len(onsets) == 0:
+        return np.zeros((num_patches, patch_frames), dtype=np.float32)
+    index = np.searchsorted(onsets, frames)
+    after = onsets[np.minimum(index, len(onsets) - 1)]
+    before = onsets[np.maximum(index - 1, 0)]
+    distance = np.minimum(np.abs(after - frames), np.abs(frames - before))
+    bias = strength * np.exp(-0.5 * (distance / width_frames) ** 2)
+    return bias.reshape(num_patches, patch_frames).astype(np.float32)
+
+
+def trim_lead(rows: np.ndarray) -> tuple[np.ndarray, int]:
+    """原曲の最初の音より前 (無音や拍だけの部分) を詰め、詰めたフレーム数と一緒に返す。
+
+    学習ではカバーの先頭は原曲の最初の音のあと (中央値 0.55 秒後) に写るので、曲の始まりで原曲がまだ鳴っていない
+    状態を見たことがない。原曲の頭から生成すると、最初の音までの数秒 (中央値 1 秒、4 曲に 1 曲は 2.4 秒以上) は
+    原曲が無音のまま曲の始まりを生成することになり、冒頭が崩れたり EOS を出して止まったりする。
+    生成は最初の音から始め、出力を詰めたフレーム数だけ後ろにずらして原曲の時刻に戻す。
+    コードとキーは始まりの時点の値が分かるよう、最初の音より前の最後のものを 0 に置く。拍は捨てる。
+    """
+    notes = rows[rows[:, ROW_TYPE] == TYPE_NOTE]
+    if len(notes) == 0:
+        return rows, 0
+    lead = int(notes[:, ROW_ONSET].min())
+    rows = rows.astype(np.int64)
+    before = rows[:, ROW_ONSET] < lead
+    keep = ~before
+    for row_type in (TYPE_CHORD, TYPE_KEY):
+        earlier = np.flatnonzero(before & (rows[:, ROW_TYPE] == row_type))
+        if len(earlier):
+            last = earlier[np.argmax(rows[earlier, ROW_ONSET])]
+            rows[last, ROW_ONSET] = lead
+            keep[last] = True
+    rows = rows[keep]
+    rows[:, ROW_ONSET] -= lead
+    return sort_rows(rows).astype(np.int32), lead
+
+
+def sort_rows(rows: np.ndarray) -> np.ndarray:
+    return rows[np.lexsort((rows[:, ROW_A], rows[:, ROW_TYPE], rows[:, ROW_ONSET]))]
+
+
+# ----------------------------------------------------------------------
+# 拡張 (カバー側と同じ量をかける)
+# ----------------------------------------------------------------------
+def stretch_rows(rows: np.ndarray, factor: float) -> np.ndarray:
+    rows = rows.astype(np.int64)
+    rows[:, ROW_ONSET] = np.round(rows[:, ROW_ONSET] * factor)
+    notes = rows[:, ROW_TYPE] == TYPE_NOTE
+    rows[notes, ROW_B] = np.maximum(1, np.round(rows[notes, ROW_B] * factor))
+    return rows
+
+
+def transpose_rows(rows: np.ndarray, shift: int) -> np.ndarray:
+    rows = rows.astype(np.int64)
+    pitched = (rows[:, ROW_TYPE] == TYPE_NOTE) & (rows[:, ROW_D] != DRUM_ID)
+    rows[pitched, ROW_A] += shift
+    rows = rows[~pitched | ((rows[:, ROW_A] >= 0) & (rows[:, ROW_A] <= 127))]
+    chords = rows[:, ROW_TYPE] == TYPE_CHORD
+    for column, empty in ((ROW_A, NO_CHORD), (ROW_C, NO_BASS)):
+        target = chords & (rows[:, column] != empty)
+        rows[target, column] = (rows[target, column] + shift) % 12
+    keys = rows[:, ROW_TYPE] == TYPE_KEY
+    rows[keys, ROW_A] = (rows[keys, ROW_A] + shift) % 12
+    return rows
+
+
+# ----------------------------------------------------------------------
+# エンコーダの入力
+# ----------------------------------------------------------------------
+class SourceVocab:
+    """行の属性を 1 つの埋め込み表の番号にする。0 はパディング (ゼロベクトル)"""
+
+    def __init__(self, tokenizer_config) -> None:
+        if not isinstance(tokenizer_config, TokenizerConfig):
+            # 拍のトークンのモデルでも、原曲の行の長さとベロシティの番号は時刻のトークナイザーのもの (フレーム)
+            tokenizer_config = TokenizerConfig()
+        sizes = {
+            "type": NUM_TYPES,
+            "pitch": 128,
+            "duration": tokenizer_config.num_duration_bins,
+            "velocity": tokenizer_config.num_velocity_bins,
+            "instrument": len(INSTRUMENTS),
+            "downbeat": 2,
+            "root": 13,
+            "quality": len(CHORD_QUALITIES),
+            "bass": 13,
+            "tonic": 12,
+            "mode": 2,
+            # 以前のチェックポイントの表 (source_vocab_size) はここまで。SheetSage のメロディ (歌 / 楽器) は後ろに足す
+            "sheetsage": 2,
+            # 原曲の音声の特徴の行 (piano_cover.audio_frames)。中身は CoverModel.frame_projection で足す
+            "frame": 1,
+        }
+        self.offset: dict[str, int] = {}
+        next_index = 1
+        for name, size in sizes.items():
+            self.offset[name] = next_index
+            next_index += size
+        self.size = next_index
+
+
+def source_features(
+    rows: np.ndarray,
+    end_frame: int,
+    tokenizer: PianoTokenizer,
+    vocab: SourceVocab,
+    max_rows: int,
+    grid=None,
+    ticks_per_beat: int = 12,
+    frames: np.ndarray | None = None,
+    frame_hz: float = 25.0,
+    max_frame_rows: int = 128,
+) -> dict[str, np.ndarray]:
+    """行をパッチごとに並べる。
+
+    grid (piano_ar.beat_tokenizer.BeatGrid、原曲の拍) を渡すと、1 パッチ = 原曲の 1 小節にし、行の位置を原曲の拍の
+    刻み (拍の番号 x ticks_per_beat) にする (拍のトークンのカバーモデル)。音の長さとベロシティの番号はフレームのまま。
+
+    frames [T, D] (原曲の音声の特徴、frame_hz、0 番目は音声の頭。piano_cover.audio_frames) を渡すと、各パッチの行の後ろに
+    特徴の行 (種類は SourceVocab の frame) を足す。行数の上限 max_rows とは別に、1 パッチ max_frame_rows 行まで
+    (多ければ等間隔に間引く)。そのときは frame_index と frames も返す。
+
+    返り値 (S = 曲のパッチ数, R = 1 パッチの行数の最大):
+        features [S, R, 5] int16  埋め込み表の番号 (種類, 属性 4 つ)。0 はパディング
+        onset    [S, R] int32     行の絶対フレーム (grid があれば絶対の刻み。Local の cross-attention の位置に使う)
+        valid    [S, R] bool
+        patch_start [S] int64     パッチの始まり (フレーム、grid があれば刻み)
+        frame_index [S, R] int32  特徴の行が frames の何番目か (特徴の行でなければ -1。frames を渡したときだけ)
+        frames      [Nf, D]       特徴の行の中身 (float16)
+    """
+    rows = rows.astype(np.int64, copy=True)  # COVERSTUDIO_BOUNDARY_FIX_20261031
+    if grid is None:
+        F = tokenizer.patch_frames
+        num_patches = max(1, -(-end_frame // F))
+        starts = np.arange(num_patches) * F
+        end = num_patches * F
+    else:
+        rows[:, ROW_ONSET] = np.round(grid.beat_position(rows[:, ROW_ONSET]) * ticks_per_beat)
+        bar_ticks = grid.bar_starts * ticks_per_beat
+        end_tick = int(np.ceil(grid.beat_position(np.array([end_frame]))[0] * ticks_per_beat))
+        num_patches = max(1, int(np.searchsorted(bar_ticks, end_tick, side="left")))
+        num_patches = min(num_patches, grid.num_bars)
+        starts = bar_ticks[:num_patches]
+        end = int(bar_ticks[num_patches])
+    # Do NOT discard key/chord changes from the time before the first kept bar.
+    # In beat-grid mode the first modeled bar can start well after audio time 0.
+    # Preserve state-change history separately while excluding earlier notes/beats.
+    history = {
+        kind: rows[rows[:, ROW_TYPE] == kind].copy()
+        for kind in (TYPE_CHORD, TYPE_KEY)
+    }
+    rows = rows[(rows[:, ROW_ONSET] >= starts[0]) & (rows[:, ROW_ONSET] < end)]
+
+    def patch_of(onset: np.ndarray) -> np.ndarray:
+        return np.searchsorted(starts, onset, side="right") - 1
+
+    # パッチの先頭に「その時点のコード / キー」を足す (パッチの先頭ちょうどで変わる場合はその行があるので足さない)
+    state_rows = []
+    for row_type, state_type in ((TYPE_CHORD, TYPE_CHORD_STATE), (TYPE_KEY, TYPE_KEY_STATE)):
+        changes = history[row_type]
+        if len(changes) == 0:
+            continue
+        change_times = changes[:, ROW_ONSET]
+        at_or_after = np.searchsorted(change_times, starts, side="left")
+        index = at_or_after - 1
+        # Do not insert the *previous* state if a new chord/key starts
+        # exactly at the bar boundary: the actual change event already exists.
+        changes_at_start = np.zeros(len(starts), dtype=bool)
+        valid_index = at_or_after < len(changes)
+        changes_at_start[valid_index] = (
+            change_times[at_or_after[valid_index]] == starts[valid_index]
+        )
+        has = (index >= 0) & ~changes_at_start
+        state = changes[index[has]].copy()
+        state[:, ROW_ONSET] = starts[has]
+        state[:, ROW_TYPE] = state_type
+        state_rows.append(state)
+    if state_rows:
+        rows = np.concatenate([rows, *state_rows])
+    # 同じパッチの中はコード/キーの状態 -> 時刻順
+    is_state = rows[:, ROW_TYPE] >= TYPE_CHORD_STATE
+    rows = rows[np.lexsort((rows[:, ROW_TYPE], rows[:, ROW_ONSET], ~is_state, patch_of(rows[:, ROW_ONSET])))]
+
+    patch = patch_of(rows[:, ROW_ONSET])
+    first = np.searchsorted(patch, np.arange(num_patches))
+    rank = np.arange(len(rows)) - first[patch]
+    keep = rank < max_rows
+    rows, patch, rank = rows[keep], patch[keep], rank[keep]
+    width = max(1, int(rank.max(initial=-1)) + 1)
+
+    o = vocab.offset
+    t = rows[:, ROW_TYPE]
+    a, b, c, d = rows[:, ROW_A], rows[:, ROW_B], rows[:, ROW_C], rows[:, ROW_D]
+    feature = np.zeros((len(rows), 5), dtype=np.int64)
+    feature[:, 0] = o["type"] + t
+    note = t == TYPE_NOTE
+    feature[note, 1] = o["pitch"] + a[note]
+    feature[note, 2] = o["duration"] + tokenizer.duration_bin(b[note])
+    feature[note, 3] = o["velocity"] + tokenizer.velocity_bin(c[note])
+    feature[note, 4] = o["instrument"] + d[note]
+    sheetsage = note & (d >= SHEETSAGE_SUNG)
+    feature[sheetsage, 4] = o["sheetsage"] + d[sheetsage] - SHEETSAGE_SUNG
+    beat = t == TYPE_BEAT
+    feature[beat, 1] = o["downbeat"] + a[beat]
+    chord = (t == TYPE_CHORD) | (t == TYPE_CHORD_STATE)
+    feature[chord, 1] = o["root"] + a[chord]
+    feature[chord, 2] = o["quality"] + b[chord]
+    feature[chord, 3] = o["bass"] + c[chord]
+    key = (t == TYPE_KEY) | (t == TYPE_KEY_STATE)
+    feature[key, 1] = o["tonic"] + a[key]
+    feature[key, 2] = o["mode"] + b[key]
+
+    position = rows[:, ROW_ONSET]
+    frame_rows = None
+    if frames is not None:
+        # 特徴の行: 各フレームの中央の時刻を、行と同じ位置 (フレーム、grid があれば刻み) にする
+        times = (np.arange(len(frames)) + 0.5) * tokenizer.config.frame_rate / frame_hz
+        frame_pos = np.round(grid.beat_position(times) * ticks_per_beat) if grid is not None else np.round(times)
+        frame_ids = np.flatnonzero((frame_pos >= starts[0]) & (frame_pos < end))
+        frame_pos = frame_pos[frame_ids].astype(np.int64)
+        frame_patch = patch_of(frame_pos)
+        frame_rank = np.arange(len(frame_patch)) - np.searchsorted(frame_patch, np.arange(num_patches))[frame_patch]
+        count = np.bincount(frame_patch, minlength=num_patches)[frame_patch]
+        # 多いパッチは等間隔に max_frame_rows 個だけ残す
+        slot = frame_rank * max_frame_rows // np.maximum(count, 1)
+        keep = (count <= max_frame_rows) | (frame_rank == 0) | (slot != (frame_rank - 1) * max_frame_rows // count)
+        frame_ids, frame_pos, frame_patch = frame_ids[keep], frame_pos[keep], frame_patch[keep]
+        frame_rank = np.arange(len(frame_patch)) - np.searchsorted(frame_patch, np.arange(num_patches))[frame_patch]
+        frame_rank = frame_rank + np.bincount(patch, minlength=num_patches)[frame_patch]  # 音などの行の後ろ
+        width = max(width, int(frame_rank.max(initial=-1)) + 1)
+        frame_rows = (frame_patch, frame_rank, frame_pos)
+
+    features = np.zeros((num_patches, width, 5), dtype=np.int16)
+    onset = np.zeros((num_patches, width), dtype=np.int32)
+    valid = np.zeros((num_patches, width), dtype=bool)
+    features[patch, rank] = feature
+    onset[patch, rank] = position
+    valid[patch, rank] = True
+    out = {"features": features, "onset": onset, "valid": valid, "patch_start": starts.astype(np.int64)}
+    if frame_rows is not None:
+        frame_patch, frame_rank, frame_pos = frame_rows
+        frame_index = np.full((num_patches, width), -1, dtype=np.int32)
+        features[frame_patch, frame_rank, 0] = o["frame"]
+        onset[frame_patch, frame_rank] = frame_pos
+        valid[frame_patch, frame_rank] = True
+        frame_index[frame_patch, frame_rank] = np.arange(len(frame_ids))
+        out["frame_index"] = frame_index
+        out["frames"] = np.asarray(frames[frame_ids], dtype=np.float16)
+    return out

@@ -1,0 +1,11 @@
+# Cover Studio を tsumugi の環境 (uv sync --locked --extra stem で作ったもの) で動かすときに足すもの。
+# torch と numpy は tsumugi の環境に入っている版をそのまま使う (Colab のノートブックはこの形)
+symusic
+mido>=1.3.3
+safetensors
+huggingface_hub
+fastapi
+uvicorn
+python-multipart
+# V2 のモデルが使う、原曲の音声の拍・メロディと音声の特徴 (torch / torchaudio / numba / soundfile は tsumugi の環境のもの)
+sheetsage2-refined @ git+https://github.com/anime-song/SheetSage2-Refined

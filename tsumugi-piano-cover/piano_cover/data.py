@@ -1,0 +1,541 @@
+"""カバー学習のデータ。カバーの窓 (デコーダの入力) と、原曲の全曲 (エンコーダの入力) を組にして返す。"""
+
+from __future__ import annotations
+
+import json
+import random
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, WeightedRandomSampler
+
+from piano_ar.config import TokenizerConfig
+from piano_ar.data import (
+    DYNAMICS_MIN_NOTES,
+    AugmentConfig,
+    PianoWindowDataset,
+    collate,
+    dynamics_item,
+    quantize_dynamics,
+    sampling_weights,
+    shift_velocity,
+    stretch_events,
+    transpose_events,
+    window_locate,
+)
+from piano_ar.tokenizer import KIND, KIND_NOTE, ONSET, PAD, PianoTokenizer, sort_events
+
+from .arrangement import ARRANGEMENT_NAMES, arrangement_values, map_to_source
+from .config import CoverConfig
+from .rollout import Rollout, RolloutBank
+from .source import (
+    INSTRUMENT_ID,
+    ROW_D,
+    ROW_TYPE,
+    TYPE_BEAT,
+    TYPE_CHORD,
+    TYPE_KEY,
+    TYPE_NOTE,
+    SourceVocab,
+    is_sheetsage,
+    sort_rows,
+    source_features,
+    stretch_rows,
+    transpose_rows,
+)
+
+SPLITS = {"train": 0, "val": 1, "test": 2}
+MELODY_ID = INSTRUMENT_ID["melody"]
+
+
+@dataclass(frozen=True)
+class DriftConfig:
+    """窓の前半 (文脈) のカバーの時刻を原曲に対してゆっくりずらし、後半は正しいまま返す。損失は後半だけで取る。
+
+    生成では自分の出した過去が原曲から少しずつずれていくが (exposure bias)、学習では過去が常に原曲と合っているので、
+    ずれた状態から原曲に戻ることを学べない (v1 は約 2% 遅いテンポでずれていき、8 分音符 1 つ分で戻っていた)。
+    文脈の最後の ramp 秒で 0 から shift まで線形にずらし (テンポのずれ)、そのあと正しい時刻に戻った続きを当てさせる。
+    """
+
+    prob: float = 0.5  # 窓をずらす確率
+    min_shift: float = 0.02  # 文脈の終わりでのずれ (秒、符号はランダム)
+    max_shift: float = 0.15
+    min_ramp: float = 2.0  # ずれが溜まっていく長さ (秒)
+    max_ramp: float = 10.0
+    # 損失を取るのは戻った後の何パッチか (0 で窓の終わりまで)。検証で「戻る」力だけを測るときに絞る
+    loss_patches: int = 0
+
+
+def drift_events(events: np.ndarray, split: int, shift: float, ramp: float) -> np.ndarray:
+    """split フレームより前のイベントを、split - ramp から split まで 0 -> shift フレームと線形に増えるだけずらす"""
+    events = events.astype(np.int64)
+    onset = events[:, ONSET]
+    before = onset < split
+    amount = shift * np.clip((onset - (split - ramp)) / ramp, 0.0, 1.0)
+    events[before, ONSET] = np.maximum(0, np.round(onset[before] + amount[before]))
+    return sort_events(events)
+
+
+class CoverCache:
+    """prepare.py が作ったキャッシュ。大きな配列は DataLoader の各ワーカーで遅延して mmap で開く"""
+
+    def __init__(self, cache_dir: str | Path) -> None:
+        self.cache_dir = Path(cache_dir)
+        sources = np.load(self.cache_dir / "sources.npz")
+        self.source_offsets = sources["offsets"]
+        self.source_end_frames = sources["end_frames"]
+        self.source_ids = sources["video_ids"]
+        covers = np.load(self.cache_dir / "covers.npz")
+        self.cover_offsets = covers["offsets"]
+        self.align_offsets = covers["align_offsets"]
+        self.end_frames = covers["end_frames"]
+        self.video_ids = covers["video_ids"]
+        self.source_index = covers["source_index"]
+        self.channels = covers["channels"]
+        self.split = covers["split"]
+        self.meta = json.loads((self.cache_dir / "meta.json").read_text(encoding="utf-8"))
+        self.tokenizer_config = TokenizerConfig(**self.meta["tokenizer"])
+        self.align_step = int(self.meta["align_step"])
+        self._arrays: dict[str, np.ndarray] | None = None
+
+    def _open(self) -> dict[str, np.ndarray]:
+        if self._arrays is None:
+            self._arrays = {
+                name: np.load(self.cache_dir / f"{name}.npy", mmap_mode="r")
+                for name in ("source_rows", "cover_events", "align", "align_ok")
+                if name != "align_ok" or (self.cache_dir / "align_ok.npy").exists()
+            }
+        return self._arrays
+
+    def cover_events(self, cover: int) -> np.ndarray:
+        return np.asarray(self._open()["cover_events"][self.cover_offsets[cover] : self.cover_offsets[cover + 1]])
+
+    def cover_align(self, cover: int) -> np.ndarray:
+        return np.asarray(self._open()["align"][self.align_offsets[cover] : self.align_offsets[cover + 1]])
+
+    def cover_align_ok(self, cover: int) -> np.ndarray | None:
+        """カバーの ALIGN_STEP ごとに原曲に沿っているか (piano_cover.prepare.sync_ok)。古いキャッシュにはない"""
+        arrays = self._open()
+        if "align_ok" not in arrays:
+            return None
+        return np.asarray(arrays["align_ok"][self.align_offsets[cover] : self.align_offsets[cover + 1]])
+
+    def source_rows(self, source: int) -> np.ndarray:
+        return np.asarray(self._open()["source_rows"][self.source_offsets[source] : self.source_offsets[source + 1]])
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_arrays"] = None
+        return state
+
+
+def empty_source() -> dict[str, torch.Tensor]:
+    return {
+        "src_features": torch.zeros(1, 1, 5, dtype=torch.int16),
+        "src_onset": torch.zeros(1, 1, dtype=torch.int32),
+        "src_valid": torch.zeros(1, 1, dtype=torch.bool),
+        "src_patch_valid": torch.zeros(1, dtype=torch.bool),
+        "plan_target": torch.full((1, 2), float("nan")),
+    }
+
+
+def plan_target(
+    events: np.ndarray, align: np.ndarray, align_step: int, factor: float, num_patches: int, patch_frames: int
+) -> np.ndarray:
+    """原曲のパッチごとの、カバーの強さ (平均ベロシティ) と音の多さ (音の数の log) を、カバーの中で標準化したもの [S, 2]。
+
+    Planner (原曲から強弱の曲線を予測する) の正解。カバーの音をアラインメントで原曲の時刻に写して数える。
+    カバーが弾いていない所と、強さを測れない所 (音が少ない) は NaN。
+    """
+    out = np.full((num_patches, 2), np.nan, dtype=np.float32)
+    notes = events[events[:, 1] == 2]
+    if len(notes) < 10:
+        return out
+    mapped = factor * np.interp(notes[:, 0] / factor / align_step, np.arange(len(align)), align)
+    patch = np.clip((mapped // patch_frames).astype(np.int64), 0, num_patches - 1)
+    count = np.bincount(patch, minlength=num_patches)
+    mean = np.bincount(patch, weights=notes[:, 4].astype(np.float64), minlength=num_patches) / np.maximum(count, 1)
+    # カバーが弾いている範囲 (端のパッチは半端なので除く)
+    lo, hi = int(factor * align[0] // patch_frames) + 1, int(factor * align[-1] // patch_frames)
+    inside = np.zeros(num_patches, dtype=bool)
+    inside[max(lo, 0) : max(hi, 0)] = True
+    loud = inside & (count >= DYNAMICS_MIN_NOTES)
+    if loud.sum() >= 5 and mean[loud].std() > 0:
+        out[loud, 0] = (mean[loud] - mean[loud].mean()) / mean[loud].std()
+    density = np.log1p(count[inside])
+    if inside.sum() >= 5 and density.std() > 0:
+        out[inside, 1] = (density - density.mean()) / density.std()
+    return out
+
+
+def patch_sync(
+    ok: np.ndarray, start: int, num_patches: int, patch_frames: int, factor: float, align_step: int
+) -> np.ndarray:
+    """窓の各パッチ (伸縮後のフレーム start + k * patch_frames から) が原曲に沿っているか [num_patches]。
+    ok (ALIGN_STEP ごと、伸縮前) の半分以上が 1 なら沿っているとする。カバーの外のパッチは沿っているとする"""
+    bounds = (start + np.arange(num_patches + 1) * patch_frames) / factor / align_step
+    first = np.clip(np.floor(bounds[:-1]).astype(np.int64), 0, len(ok))
+    last = np.clip(np.ceil(bounds[1:]).astype(np.int64), 0, len(ok))
+    cumulative = np.concatenate([[0], np.cumsum(ok, dtype=np.int64)])
+    count = last - first
+    rate = (cumulative[last] - cumulative[first]) / np.maximum(count, 1)
+    return (count == 0) | (rate >= 0.5)
+
+
+def source_tensors(features: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
+    out = {
+        "src_features": torch.from_numpy(features["features"]),
+        "src_onset": torch.from_numpy(features["onset"]),
+        "src_valid": torch.from_numpy(features["valid"]),
+        "src_patch_valid": torch.ones(features["features"].shape[0], dtype=torch.bool),
+    }
+    if "frames" in features:  # 原曲の音声の特徴の行 (source_features の frames)
+        out["src_frame_index"] = torch.from_numpy(features["frame_index"])
+        out["src_frames"] = torch.from_numpy(features["frames"])
+    return out
+
+
+class CoverWindowDataset(Dataset):
+    """カバーから固定長の窓を切り出し、原曲の全曲と、窓の各パッチに対応する原曲の時刻を付けて返す。
+
+    学習用は窓の位置がランダムで、原曲とカバーに同じ時間伸縮・移調をかける (ベロシティのずらしはカバーだけ)。
+    source_dropout の確率で原曲を外し (CFG 用)、structure_dropout の確率で拍・コード・キーをそれぞれ外す
+    (推定値なので、なくても動くようにする)。melody_dropout の確率で、tsumugi のメロディと SheetSage のメロディを
+    それぞれ外す (片方が間違っていても、もう片方や伴奏から弾けるようにする)。
+    pretraining を渡すと、index が カバーの数 以上のときは事前学習の曲を原曲なしで返す (忘却を防ぐため混ぜる)。
+    drift を渡すと、窓の前半のカバーの時刻をずらして後半で原曲に戻らせる (DriftConfig)。検証では窓ごとに決まった乱数で
+    ずらすので、毎回同じ窓になる。
+    memory_patches と val_start_patch は PianoWindowDataset と同じ (窓の前の記憶。pretraining も同じ長さにそろえる)。
+    dynamics_bins > 0 なら、窓のパッチごとの強弱と音の多さの条件 (piano_ar.data.dynamics_item) と、
+    Planner の正解 (原曲のパッチごとの曲線、plan_target) も返す。arrangement なら、その後ろに編曲の性質
+    (piano_cover.arrangement の fill / above / span) の列も足す (条件は強弱と同じ確率で列ごとに落とす)。
+    sync_mask なら、原曲に沿っていない所 (キャッシュの align_ok が半分以上 0 のパッチ) の損失を取らない
+    (窓の損失を取るパッチが全部なくなるときは外さない)。
+    rollouts (piano_cover.rollout) を渡すと、学習では rollout_prob の確率で、その窓をモデル自身が生成したパッチに
+    差し替え、その後の正解のパッチだけで損失を取る (自分の生成の失敗から原曲に戻る学習。時間伸縮などとずらし学習は
+    かけない)。検証 (rollout_eval) ではロールアウトを 1 つずつ順に使い、差し替えた後の rollout_loss_patches
+    パッチだけで損失を取る。
+    """
+
+    def __init__(
+        self,
+        cache: CoverCache,
+        *,
+        split: str,
+        window_patches: int,
+        cover_config: CoverConfig,
+        augment: AugmentConfig | None = None,
+        song_start_prob: float = 0.1,
+        channel_dropout: float = 0.15,
+        source_dropout: float = 0.1,
+        structure_dropout: float = 0.2,
+        melody_dropout: float = 0.0,
+        pretraining: PianoWindowDataset | None = None,
+        drift: DriftConfig | None = None,
+        memory_patches: int = 0,
+        val_start_patch: int = 0,
+        dynamics_bins: int = 0,
+        dynamics_dropout: float = 0.2,
+        arrangement: bool = False,
+        sync_mask: bool = False,
+        rollouts: RolloutBank | None = None,
+        rollout_prob: float = 0.0,
+        rollout_eval: bool = False,
+        rollout_loss_patches: int = 0,
+    ) -> None:
+        self.cache = cache
+        self.rollouts = rollouts
+        self.rollout_prob = rollout_prob
+        self.rollout_eval = rollout_eval and rollouts is not None
+        self.rollout_loss_patches = rollout_loss_patches
+        self.arrangement = arrangement and dynamics_bins > 0
+        self.sync_mask = sync_mask
+        self.dynamics_bins = dynamics_bins
+        self.dynamics_dropout = dynamics_dropout if split == "train" else 0.0
+        self.tokenizer = PianoTokenizer(cache.tokenizer_config)
+        self.vocab = SourceVocab(cache.tokenizer_config)
+        self.window_patches = window_patches
+        self.cover_config = cover_config
+        self.train = split == "train"
+        self.augment = augment if self.train else None
+        self.song_start_prob = song_start_prob
+        self.channel_dropout = channel_dropout if self.train else 0.0
+        self.source_dropout = source_dropout
+        self.structure_dropout = structure_dropout if self.train else 0.0
+        self.melody_dropout = melody_dropout if self.train else 0.0
+        self.covers = np.flatnonzero(cache.split == SPLITS[split])
+        self.pretraining = pretraining
+        self.drift = drift
+        self.memory_patches = memory_patches
+        self.val_start_patch = val_start_patch
+
+    def __len__(self) -> int:
+        if self.rollout_eval:
+            return len(self.rollouts)
+        return len(self.covers) + (len(self.pretraining) if self.pretraining is not None else 0)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        if self.rollout_eval:
+            rollout = self.rollouts[index]
+            return self.cover_item(rollout.cover, index, rollout=rollout)
+        if index >= len(self.covers):
+            item = self.pretraining[index - len(self.covers)]
+            item["align"] = torch.zeros(len(item["tokens"]), 2)
+            item["has_source"] = torch.tensor(False)
+            item.update(empty_source())
+            if self.arrangement and "dynamics" in item:
+                # 事前学習の曲には原曲がないので、編曲の性質の列は「指定なし」
+                extra = torch.zeros(len(item["dynamics"]), len(ARRANGEMENT_NAMES), dtype=item["dynamics"].dtype)
+                item["dynamics"] = torch.cat([item["dynamics"], extra], dim=1)
+            return item
+
+        cover = int(self.covers[index])
+        rollout = None
+        if self.rollouts is not None and self.train and random.random() < self.rollout_prob:
+            rollout = self.rollouts.pick(cover)
+        return self.cover_item(cover, index, rollout=rollout)
+
+    def cover_item(
+        self, cover: int, index: int, *, first: int | None = None, rollout: Rollout | None = None
+    ) -> dict[str, torch.Tensor]:
+        """カバー cover の窓。first で損失を取る窓の始まりのフレームを決められる (ロールアウトを作るとき)"""
+        source = int(self.cache.source_index[cover])
+        events = self.cache.cover_events(cover)
+        end_frame = int(self.cache.end_frames[cover])
+        align = self.cache.cover_align(cover)
+        rows = self.cache.source_rows(source)
+        source_end = int(self.cache.source_end_frames[source])
+
+        factor = 1.0
+        # ロールアウトは伸縮・移調なしの窓で作ったので、差し替えるときは同じ窓にする
+        augment = self.augment if rollout is None else None
+        if augment is not None:
+            a = augment
+            if a.time_stretch > 0:
+                factor = random.uniform(1 - a.time_stretch, 1 + a.time_stretch)
+                events, end_frame = stretch_events(events, end_frame, factor)
+                rows = sort_rows(stretch_rows(rows, factor))
+                source_end = int(round(source_end * factor))
+            if a.transpose > 0:
+                shift = random.randint(-a.transpose, a.transpose)
+                events = transpose_events(events, shift, self.tokenizer.config)
+                rows = transpose_rows(rows, shift)
+            if a.velocity_shift > 0:
+                events = shift_velocity(events, random.randint(-a.velocity_shift, a.velocity_shift))
+
+        F = self.tokenizer.patch_frames
+        window, patch_loss, start = window_locate(
+            self.tokenizer,
+            events,
+            end_frame,
+            self.window_patches,
+            self.memory_patches,
+            train=self.train,
+            song_start_prob=self.song_start_prob,
+            val_start_patch=self.val_start_patch,
+            first=rollout.first if rollout is not None else first,
+        )
+        song_start = start == 0
+        total = len(patch_loss)
+        if rollout is not None:
+            patch_loss = self._apply_rollout(window, patch_loss, rollout, start)
+        else:
+            patch_loss = self._drift(window, patch_loss, events, end_frame, start, index)
+        if self.sync_mask:
+            ok = self.cache.cover_align_ok(cover)
+            if ok is not None:
+                masked = patch_loss & patch_sync(
+                    ok, start, total, self.tokenizer.patch_frames, factor, self.cache.align_step
+                )
+                if masked.any():
+                    patch_loss = masked
+
+        # 窓の各パッチの始まりと終わりが、原曲のどのフレームに当たるか (伸縮したら両方の時刻を factor 倍する)
+        bounds = start + np.arange(total + 1) * F
+        mapped = factor * np.interp(bounds / factor / self.cache.align_step, np.arange(len(align)), align)
+        align_window = np.stack([mapped[:-1], mapped[1:]], axis=1).astype(np.float32)
+        frame_rate = self.tokenizer.config.frame_rate
+        if self.arrangement:
+            notes = events[events[:, KIND] == KIND_NOTE]
+            note_times = map_to_source(notes[:, ONSET].astype(np.float64), align, self.cache.align_step, factor)
+            # 窓の各パッチの編曲の性質 (パッチの境界を原曲の時刻に写した区間で測る)
+            window_arrangement = arrangement_values(events, note_times, rows, mapped, frame_rate)
+
+        has_source = random.random() >= self.source_dropout
+        if has_source:
+            for row_type in (TYPE_BEAT, TYPE_CHORD, TYPE_KEY):
+                if random.random() < self.structure_dropout:
+                    rows = rows[rows[:, ROW_TYPE] != row_type]
+            if self.melody_dropout > 0:
+                tsumugi = (rows[:, ROW_TYPE] == TYPE_NOTE) & (rows[:, ROW_D] == MELODY_ID)
+                drop = np.zeros(len(rows), dtype=bool)
+                for melody in (tsumugi, is_sheetsage(rows)):
+                    if random.random() < self.melody_dropout:
+                        drop |= melody
+                rows = rows[~drop]
+            features = source_features(rows, source_end, self.tokenizer, self.vocab, self.cover_config.max_source_rows)
+            source_items = source_tensors(features)
+            if self.dynamics_bins:
+                S = len(features["features"])
+                target = plan_target(events, align, self.cache.align_step, factor, S, F)
+                if self.arrangement:
+                    values = arrangement_values(events, note_times, rows, np.arange(S + 1) * F, frame_rate)
+                    target = np.concatenate([target, values.astype(np.float32)], axis=1)
+                source_items["plan_target"] = torch.from_numpy(target)
+        else:
+            source_items = empty_source()
+
+        channel = int(self.cache.channels[cover])
+        if random.random() < self.channel_dropout:
+            channel = 0
+        dynamics = dynamics_item(events, end_frame, start, total, F, self.dynamics_bins, self.dynamics_dropout)
+        if self.arrangement:
+            index = quantize_dynamics(window_arrangement, self.dynamics_bins)
+            if self.dynamics_dropout > 0:
+                if random.random() < self.dynamics_dropout:
+                    index[:] = 0
+                else:
+                    for column in range(index.shape[1]):
+                        if random.random() < self.dynamics_dropout / 2:
+                            index[:, column] = 0
+            dynamics["dynamics"] = torch.cat([dynamics["dynamics"], torch.from_numpy(index)], dim=1)
+        return {
+            "tokens": torch.from_numpy(window["tokens"]),
+            "patch_valid": torch.from_numpy(window["patch_valid"]),
+            "pedal_state": torch.from_numpy(window["pedal_state"]),
+            "channel": torch.tensor(channel),
+            "song_start": torch.tensor(int(song_start)),
+            "align": torch.from_numpy(align_window),
+            "has_source": torch.tensor(has_source),
+            "patch_loss": torch.from_numpy(patch_loss),
+            **dynamics,
+            **source_items,
+        }
+
+    def _apply_rollout(
+        self, window: dict[str, np.ndarray], patch_loss: np.ndarray, rollout: Rollout, start: int
+    ) -> np.ndarray:
+        """窓のパッチ rollout.split から先をロールアウトのトークンとペダルに差し替え、その後だけで損失を取る"""
+        if start != rollout.start:
+            raise ValueError(
+                f"ロールアウトの窓の始まり {rollout.start} と作り直した窓 {start} が違う (記憶の長さが違う?)"
+            )
+        width = window["tokens"].shape[1]
+        for j, (tokens, pedal) in enumerate(zip(rollout.patches, rollout.pedal)):
+            row = np.full(width, PAD, dtype=window["tokens"].dtype)
+            row[: min(len(tokens), width)] = tokens[:width]
+            window["tokens"][rollout.split + j] = row
+            window["pedal_state"][rollout.split + j] = int(pedal)
+        patch_loss = patch_loss.copy()
+        resume = rollout.split + len(rollout.patches)
+        patch_loss[:resume] = False
+        if self.rollout_loss_patches:
+            patch_loss[resume + self.rollout_loss_patches :] = False
+        return patch_loss
+
+    def _drift(
+        self,
+        window: dict[str, np.ndarray],
+        patch_loss: np.ndarray,
+        events: np.ndarray,
+        end_frame: int,
+        start: int,
+        index: int,
+    ) -> np.ndarray:
+        """DriftConfig の確率で、損失を取る窓の前半 (とその前の記憶) をずらしたトークンに差し替え、損失を取るパッチを返す"""
+        d = self.drift
+        rng = random if self.train else random.Random(index)
+        loss_patches = np.flatnonzero(patch_loss)
+        if d is None or len(loss_patches) < 4 or rng.random() >= d.prob:
+            return patch_loss
+        patch_loss = patch_loss.copy()
+        F = self.tokenizer.patch_frames
+        fr = self.tokenizer.config.frame_rate
+        first = int(loss_patches[0])
+        # 戻るパッチ (損失を多く残すよう窓の前半から選ぶ)
+        split = first + rng.randint(2, max(2, len(loss_patches) // 2))
+        shift = rng.uniform(d.min_shift, d.max_shift) * rng.choice((-1, 1)) * fr
+        ramp = rng.uniform(d.min_ramp, d.max_ramp) * fr
+        drifted = drift_events(events, start + split * F, shift, ramp)
+        context = self.tokenizer.tokenize_window(drifted, end_frame, start, split)
+        window["tokens"][:split] = context["tokens"]
+        window["pedal_state"][:split] = context["pedal_state"]
+        patch_loss[:split] = False
+        if d.loss_patches:
+            patch_loss[split + d.loss_patches :] = False
+        return patch_loss
+
+
+SOURCE_KEYS = (
+    "src_features",
+    "src_onset",
+    "src_valid",
+    "src_patch_valid",
+    "plan_target",
+    "src_patch_start",
+    "src_frame_index",
+    "src_frames",
+)
+
+
+def collate_cover(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    """デコーダ側は事前学習と同じ collate。原曲は曲ごとにパッチ数と行数が違うので最大に合わせて詰める"""
+    out = collate([{k: v for k, v in item.items() if k not in SOURCE_KEYS} for item in batch])
+    num_patches = max(item["src_features"].shape[0] for item in batch)
+    num_rows = max(item["src_features"].shape[1] for item in batch)
+    features = torch.zeros(len(batch), num_patches, num_rows, 5, dtype=torch.int16)
+    onset = torch.zeros(len(batch), num_patches, num_rows, dtype=torch.int32)
+    valid = torch.zeros(len(batch), num_patches, num_rows, dtype=torch.bool)
+    patch_valid = torch.zeros(len(batch), num_patches, dtype=torch.bool)
+    for i, item in enumerate(batch):
+        s, r = item["src_features"].shape[:2]
+        features[i, :s, :r] = item["src_features"]
+        onset[i, :s, :r] = item["src_onset"]
+        valid[i, :s, :r] = item["src_valid"]
+        patch_valid[i, :s] = item["src_patch_valid"]
+    out.update(src_features=features, src_onset=onset, src_valid=valid, src_patch_valid=patch_valid)
+    if any("src_patch_start" in item for item in batch):  # 拍のトークン: 原曲の小節の頭の刻み
+        starts = torch.zeros(len(batch), num_patches, dtype=torch.long)
+        for i, item in enumerate(batch):
+            if "src_patch_start" in item:
+                starts[i, : len(item["src_patch_start"])] = item["src_patch_start"]
+        out["src_patch_start"] = starts
+    if any("src_frames" in item for item in batch):
+        # 原曲の音声の特徴: 曲ごとの特徴をつなげ、行の番号をつなげた中の番号にする (特徴のない行は -1)
+        frame_index = torch.full((len(batch), num_patches, num_rows), -1, dtype=torch.int32)
+        frames, total = [], 0
+        for i, item in enumerate(batch):
+            if "src_frames" not in item:
+                continue
+            index = item["src_frame_index"]
+            s, r = index.shape
+            frame_index[i, :s, :r] = torch.where(index >= 0, index + total, -1)
+            frames.append(item["src_frames"])
+            total += len(item["src_frames"])
+        out["src_frame_index"] = frame_index
+        out["src_frames"] = torch.cat(frames)
+    if any("plan_target" in item for item in batch):
+        # 原曲のない行 (事前学習の曲) の正解は列が少ない (すべて NaN) ので、一番多い列に合わせる
+        columns = max(item["plan_target"].shape[1] for item in batch if "plan_target" in item)
+        target = torch.full((len(batch), num_patches, columns), float("nan"))
+        for i, item in enumerate(batch):
+            if "plan_target" in item:
+                s, c = item["plan_target"].shape
+                target[i, :s, :c] = item["plan_target"]
+        out["plan_target"] = target
+    return out
+
+
+def make_cover_sampler(
+    dataset: CoverWindowDataset, num_samples: int, pretrain_mix: float, channel_alpha: float = 0.5
+) -> WeightedRandomSampler:
+    """カバーは長さに比例して選ぶ。事前学習の曲は全体の pretrain_mix の割合になるよう重みを付ける"""
+    cover_weights = dataset.cache.end_frames[dataset.covers].astype(np.float64)
+    cover_weights /= cover_weights.sum()
+    weights = [cover_weights * (1 - pretrain_mix if dataset.pretraining is not None else 1.0)]
+    if dataset.pretraining is not None:
+        pretrain_weights = sampling_weights(dataset.pretraining, channel_alpha)
+        weights.append(pretrain_weights / pretrain_weights.sum() * pretrain_mix)
+    return WeightedRandomSampler(torch.from_numpy(np.concatenate(weights)), num_samples=num_samples, replacement=True)

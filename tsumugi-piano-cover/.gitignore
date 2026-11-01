@@ -1,0 +1,66 @@
+.venv*
+.transkun/
+.tsumugi/
+.vscode
+.idea/
+.workbuddy/
+Dataset/
+wandb/
+runs/
+
+# Backup & Patch Artifacts
+_backup_*/
+*.bak
+*.bak*
+*.orig
+*.tmp
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Environment / Secrets
+.env
+
+# Model Checkpoints & Logs
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+logs/
+checkpoints/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# piano_ar
+data/piano_ar/
+data/piano_cover*/
+outputs/
+
+# WireGuard configs (private keys)
+*.conf
+
+local/
+
+data/metadata/
+
+data/alignments/
+data/piano_score/
+data/sheetsage/
+data/audio_frames/
+
+# 公開用に書き出した重み (piano_ar.export / piano_cover.export) と UI のプロジェクト
+pretrained/
+pretrained_v2/
+projects/
+cover_studio/static/
+web/node_modules/
