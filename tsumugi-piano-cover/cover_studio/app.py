@@ -260,8 +260,12 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
             raise HTTPException(400, f"対応していないファイルです ({' / '.join(exts)}): {name}")
         path = root / ".uploads" / uuid.uuid4().hex / name
         path.parent.mkdir(parents=True)
-        with open(path, "wb") as f:
-            shutil.copyfileobj(upload.file, f)
+        try:
+            with open(path, "wb") as f:
+                shutil.copyfileobj(upload.file, f)
+        except BaseException:
+            shutil.rmtree(path.parent, ignore_errors=True)
+            raise
         return path
 
     def submit_transcribe(p: Project) -> Job:
@@ -282,8 +286,8 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     @app.post("/api/engine/unload")
     def unload():
-        if any(j.state == "running" for j in runner.jobs()):
-            raise HTTPException(409, "実行中のジョブがあります")
+        if any(j.active for j in runner.jobs()):
+            raise HTTPException(409, "実行中・待ちのジョブがあります")
         engine.unload()
         return engine.describe()
 
@@ -301,9 +305,13 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
         """音源 (と、あれば採譜済みの MIDI) からプロジェクトを作る。MIDI がなければ tsumugi の採譜を始める"""
         if audio is None and midi is None:
             raise HTTPException(400, "音源か MIDI のどちらかが要ります")
-        audio_path = save_upload(audio, AUDIO_EXTS) if audio is not None else None
-        midi_path = save_upload(midi, MIDI_EXTS) if midi is not None else None
+        if midi is None and engine.tsumugi is None:
+            raise HTTPException(400, "tsumugi が見つからないので採譜できません (MIDI を一緒に入れてください)")
+        audio_path = None
+        midi_path = None
         try:
+            audio_path = save_upload(audio, AUDIO_EXTS) if audio is not None else None
+            midi_path = save_upload(midi, MIDI_EXTS) if midi is not None else None
             name = title.strip() or Path((audio_path or midi_path).name).stem
             p = Project.create(root, name, audio_path, midi_path)
         finally:
@@ -320,10 +328,11 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     @app.patch("/api/projects/{pid}")
     def update_project(pid: str, body: ProjectPatch):
-        p = open_project(pid)
-        if body.title is not None and body.title.strip():
-            p.update(title=body.title.strip())
-        return detail(p)
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            if body.title is not None and body.title.strip():
+                p.update(title=body.title.strip())
+            return detail(p)
 
     @app.delete("/api/projects/{pid}", status_code=204)
     def delete_project(pid: str):

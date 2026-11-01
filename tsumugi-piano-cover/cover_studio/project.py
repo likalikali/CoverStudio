@@ -92,32 +92,46 @@ class Project:
     @classmethod
     def create(cls, root: Path, title: str, audio: Path | None = None, midi: Path | None = None) -> Project:
         root = Path(root).resolve()
+        root.mkdir(parents=True, exist_ok=True)
         base = safe_name(title)
-        d, n = root / base, 2
-        while d.exists():
-            d, n = root / f"{base} ({n})", n + 1
-        d.mkdir(parents=True)
-        data = {
-            "version": 1,
-            "title": title,
-            "created": now(),
-            "audio": None,
-            "audio_sha1": None,
-            "source": None,  # {"origin": "tsumugi" | "upload", "created": ...}
-            "transcribe": None,  # {"state": "queued" | "running" | "done" | "error", "error": ...}
-            "next_take": 1,
-            "next_batch": 1,
-        }
-        if audio is not None:
-            (d / "audio").mkdir()
-            shutil.copy2(audio, d / "audio" / audio.name)
-            data["audio"] = f"audio/{audio.name}"
-            data["audio_sha1"] = file_sha1(audio)
-        write_json(d / "project.json", data)
-        p = cls(d)
-        if midi is not None:
-            p.set_source(midi, "upload")
-        return p
+        n = 1
+        while True:
+            folder = base if n == 1 else f"{base} ({n})"
+            d = root / folder
+            try:
+                # mkdir is the atomic uniqueness check; exists()+mkdir() races
+                # when two upload requests create the same title concurrently.
+                d.mkdir()
+                break
+            except FileExistsError:
+                n += 1
+
+        try:
+            data = {
+                "version": 1,
+                "title": title,
+                "created": now(),
+                "audio": None,
+                "audio_sha1": None,
+                "source": None,  # {"origin": "tsumugi" | "upload", "created": ...}
+                "transcribe": None,  # {"state": "queued" | "running" | "done" | "error", "error": ...}
+                "next_take": 1,
+                "next_batch": 1,
+            }
+            if audio is not None:
+                (d / "audio").mkdir()
+                shutil.copy2(audio, d / "audio" / audio.name)
+                data["audio"] = f"audio/{audio.name}"
+                data["audio_sha1"] = file_sha1(audio)
+            write_json(d / "project.json", data)
+            p = cls(d)
+            if midi is not None:
+                p.set_source(midi, "upload")
+            return p
+        except BaseException:
+            # Do not leave a half-created project visible after an upload/copy failure.
+            shutil.rmtree(d, ignore_errors=True)
+            raise
 
     def delete(self) -> None:
         shutil.rmtree(self.dir)

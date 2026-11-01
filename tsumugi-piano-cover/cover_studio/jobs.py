@@ -130,6 +130,7 @@ class Runner:
         self._jobs: dict[str, Job] = {}
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._lock = threading.Lock()
+        self._closed = False
         self._project_locks: dict[str, threading.RLock] = {}
         self._project_locks_guard = threading.Lock()
         self._thread = threading.Thread(target=self._work, name="cover-studio-runner", daemon=True)
@@ -137,26 +138,33 @@ class Runner:
 
     def close(self) -> None:
         with self._lock:
-            for job in self._jobs.values():
-                if job.state == "queued":
-                    self._end(job, "cancelled")
-                elif job.state == "running":
-                    job._stop.set()
-        self._queue.put(None)
+            if not self._closed:
+                self._closed = True
+                for job in self._jobs.values():
+                    if job.state == "queued":
+                        self._end(job, "cancelled")
+                    elif job.state == "running":
+                        job._stop.set()
+                # Keep the shutdown marker ordered after all accepted submissions.
+                self._queue.put(None)
         self._thread.join(timeout=30)
 
     def submit(self, kind: str, project: str, takes: list[str] | None = None) -> Job:
         job = Job(uuid.uuid4().hex[:12], kind, project, list(takes or []))
         with self._lock:
+            if self._closed:
+                raise RuntimeError("job runner is closed")
             self._jobs[job.id] = job
             finished = [j.id for j in self._jobs.values() if not j.active]
             for jid in finished[: max(len(finished) - KEEP_FINISHED, 0)]:
                 del self._jobs[jid]
-        self._queue.put(job.id)
+            # Queue insertion is part of the same critical section as close().
+            self._queue.put(job.id)
         return job
 
     def get(self, job_id: str) -> Job | None:
-        return self._jobs.get(job_id)
+        with self._lock:
+            return self._jobs.get(job_id)
 
     def jobs(self, project: str | None = None) -> list[Job]:
         """新しい順"""
@@ -194,9 +202,24 @@ class Runner:
         job.state, job.finished = state, now()
         try:
             self._on_end(job)
-        except Exception:
+        except Exception as e:
             log.exception("ジョブの後片付けに失敗しました")
-        job._ended.set()
+            message = f"Finalization failed: {type(e).__name__}: {e}"
+            job.add_log(message)
+            job.error = f"{job.error}; {message}" if job.error else message
+            if state == "done":
+                job.state = "error"
+        finally:
+            job._ended.set()
+
+    def _start_queued(self, job_id: str) -> Job | None:
+        """Atomically claim a queued job so cancel() and shutdown cannot race it."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.state != "queued":
+                return None
+            job.state, job.started = "running", now()
+            return job
 
     def _work(self) -> None:
         from .engine import Cancelled
@@ -205,10 +228,9 @@ class Runner:
             job_id = self._queue.get()
             if job_id is None:
                 return
-            job = self._jobs.get(job_id)
-            if job is None or job.state != "queued":
+            job = self._start_queued(job_id)
+            if job is None:
                 continue
-            job.state, job.started = "running", now()
             try:
                 self._handle(job)
             except Cancelled:
