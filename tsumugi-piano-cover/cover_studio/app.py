@@ -351,10 +351,10 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     @app.put("/api/projects/{pid}/source")
     def upload_source(pid: str, midi: Annotated[UploadFile, File()]):
-        p = open_project(pid)
         path = save_upload(midi, MIDI_EXTS)
         try:
             with runner.project_lock(pid):
+                p = open_project(pid)
                 if runner.active_for(pid):
                     raise HTTPException(
                         409,
@@ -504,8 +504,8 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
     @app.post("/api/projects/{pid}/takes/{tid}/score")
     def score_take(pid: str, tid: str, body: ScoreIn):
+        """テイクを楽譜 (MusicXML) にするジョブを始める。原曲の拍 (SheetSage2-Refined) が要るので音源のあるプロジェクトだけ"""
         with runner.project_lock(pid):
-            """テイクを楽譜 (MusicXML) にするジョブを始める。原曲の拍 (SheetSage2-Refined) が要るので音源のあるプロジェクトだけ"""
             p = open_project(pid)
             take = find_take(p, tid)
             if take["state"] != "done":
