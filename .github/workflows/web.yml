@@ -53,7 +53,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes="CoverStudio main UI build (${GITHUB_SHA::7})."
+          notes="CoverStudio main UI build (${GITHUB_SHA})."
           if gh release view web-latest > /dev/null 2>&1; then
             gh release edit web-latest --notes "$notes"
           else
