@@ -180,17 +180,43 @@ def find_models(
     return entries
 
 
+def _checkpoint_bool(path: Path, key: str) -> bool | None:
+    """Read a primitive bool from torch.save's pickle without unpickling/executing it."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            name = next(n for n in archive.namelist() if n.endswith("/data.pkl"))
+            with archive.open(name) as stream:
+                payload = stream.read(1 << 22)
+        string_ops = {"BINUNICODE", "SHORT_BINUNICODE", "BINUNICODE8", "UNICODE"}
+        integer_ops = {"INT", "BININT", "BININT1", "BININT2"}
+        memo_ops = {"BINPUT", "LONG_BINPUT", "PUT", "MEMOIZE"}
+        operations = iter(pickletools.genops(payload))
+        for opcode, value, _position in operations:
+            if opcode.name not in string_ops or value != key:
+                continue
+            for next_opcode, next_value, _next_position in operations:
+                if next_opcode.name in memo_ops:
+                    continue
+                if next_opcode.name == "NEWTRUE":
+                    return True
+                if next_opcode.name == "NEWFALSE":
+                    return False
+                if next_opcode.name in integer_ops and next_value in (0, 1):
+                    return bool(next_value)
+                return None
+            return None
+    except (OSError, EOFError, ValueError, zipfile.BadZipFile, StopIteration):
+        return None
+    return None
+
+
 def _is_beat_score_checkpoint(path: Path) -> bool:
     """拍の上の演奏を楽譜にする学習 (--beat-input) のチェックポイントか。秒の演奏のもの (2・3 段目) は除く"""
     if not _checkpoint_has(path, b"perf2score_config"):
         return False
-    import torch
-
-    try:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
-        return bool((checkpoint.get("args") or {}).get("beat_input"))
-    except Exception:  # noqa: BLE001  読めないものは候補にしない
-        return False
+    # Checkpoints are arbitrary pickle containers. Model discovery must never
+    # execute their pickle payload merely to populate the model selector.
+    return _checkpoint_bool(path, "beat_input") is True
 
 
 def find_score_models(
