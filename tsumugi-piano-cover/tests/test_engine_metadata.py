@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import pickle
+import sys
 import zipfile
+from types import SimpleNamespace
 
 from cover_studio.engine import _checkpoint_tokenizer_type
 
