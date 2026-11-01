@@ -20,10 +20,12 @@ import json
 import os
 import pickletools
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 import zipfile
 from collections import OrderedDict
 from collections.abc import Callable
@@ -922,6 +924,18 @@ class Engine:
         # tsumugi は VRAM を多く使うので、カバーモデルを手放してから走らせる
         self.unload()
         out = project.dir / "source.tsumugi.mid"
+        # Each run gets a private work directory. The worker's own finally block
+        # cannot run when cancellation kills the process, so the parent also owns
+        # cleanup and must never share a timestamp-derived directory with another run.
+        work = (
+            Path(tempfile.gettempdir())
+            / "cover_studio_tsumugi"
+            / f"{project.id}-{uuid.uuid4().hex}"
+        )
+        work.parent.mkdir(parents=True, exist_ok=True)
+        # Never let a successful-but-incomplete worker accidentally reuse a MIDI
+        # left behind by a previous interrupted transcription.
+        out.unlink(missing_ok=True)
         command = [
             str(self.tsumugi.python),
             "-X",
@@ -935,7 +949,7 @@ class Engine:
             str(out),
             "--work",
             # ステムの音声など大きい作業ファイル (1 曲数百 MB) は、プロジェクト (Google ドライブのこともある) に置かない
-            str(Path(tempfile.gettempdir()) / "cover_studio_tsumugi" / project.data["created"].replace(":", "")),
+            str(work),
         ]
         if self.tsumugi.ffmpeg_dir:
             command += ["--ffmpeg-dir", str(self.tsumugi.ffmpeg_dir)]
@@ -945,49 +959,67 @@ class Engine:
         env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
         env.pop("VIRTUAL_ENV", None)
         progress(None, "starting")
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            cwd=str(self.tsumugi.dir),
-        )
+        process = None
         stopped = threading.Event()
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                cwd=str(self.tsumugi.dir),
+            )
 
-        def watch() -> None:
-            while process.poll() is None:
-                if should_stop():
-                    stopped.set()
-                    process.kill()
-                    return
-                stopped.wait(0.5)
+            def watch() -> None:
+                while process.poll() is None:
+                    if should_stop():
+                        stopped.set()
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                        return
+                    stopped.wait(0.5)
 
-        threading.Thread(target=watch, daemon=True).start()
-        assert process.stdout is not None
-        for line in process.stdout:  # tqdm の \r も行の区切りになる
-            line = line.rstrip()
-            if line.startswith("@@"):
-                kind, _, payload = line[2:].partition(" ")
-                if live is not None:
+            threading.Thread(target=watch, daemon=True).start()
+            assert process.stdout is not None
+            for line in process.stdout:  # tqdm の \\r も行の区切りになる
+                line = line.rstrip()
+                if line.startswith("@@"):
+                    kind, _, payload = line[2:].partition(" ")
+                    if live is not None:
+                        try:
+                            live(kind, json.loads(payload))
+                        except json.JSONDecodeError:
+                            pass
+                elif line:
+                    log(line)
+                    progress(None, line[-120:])
+            code = process.wait()
+            if should_stop():
+                raise Cancelled()
+            if code != 0 or not out.is_file() or out.stat().st_size <= 0:
+                raise RuntimeError(f"tsumugi が失敗しました (終了コード {code})。ログを確かめてください")
+            project.set_source(out, "tsumugi")
+            self._source_beats(project, progress, log)
+        finally:
+            stopped.set()
+            if process is not None:
+                if process.poll() is None:
                     try:
-                        live(kind, json.loads(payload))
-                    except json.JSONDecodeError:
+                        process.kill()
+                    except ProcessLookupError:
                         pass
-            elif line:
-                log(line)
-                progress(None, line[-120:])
-        code = process.wait()
-        stopped.set()
-        if should_stop():
-            raise Cancelled()
-        if code != 0 or not out.is_file():
-            raise RuntimeError(f"tsumugi が失敗しました (終了コード {code})。ログを確かめてください")
-        project.set_source(out, "tsumugi")
-        self._source_beats(project, progress, log)
-        out.unlink()
+                    process.wait()
+                if process.stdout is not None:
+                    process.stdout.close()
+            # A killed worker skips its Python finally block; clean both large
+            # intermediate stems and the temporary output from the parent.
+            shutil.rmtree(work, ignore_errors=True)
+            out.unlink(missing_ok=True)
 
     def describe(self) -> dict:
         return {
