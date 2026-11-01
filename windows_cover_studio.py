@@ -378,12 +378,14 @@ def check() -> None:
     say(f"路径: {BASE}")
     say(f"Git: {shutil.which('git') or '未找到'}")
     say(f"uv: {find_uv() or '未找到'}")
-    nvidia_report()
-    check_pytorch(COVER_PY, "Cover Studio")
-    check_pytorch(TSUMUGI_PY, "tsumugi")
+    gpu_ok = nvidia_report()
+    cover_ok = check_pytorch(COVER_PY, "Cover Studio")
+    tsumugi_ok = check_pytorch(TSUMUGI_PY, "tsumugi")
     ffmpeg = ffmpeg_shared_bin()
     say(f"FFmpeg Shared DLL: {ffmpeg or '未找到完整的 FFmpeg Shared（请运行 06_fix_ffmpeg_torchcodec.bat）'}")
     say(f"数据目录：{DATA}")
+    if not (gpu_ok and cover_ok and tsumugi_ok):
+        raise RuntimeError("GPU 环境检查未通过。请根据上面的检测结果修复 NVIDIA / CUDA / PyTorch 后重试。")
 
 
 def main() -> None:
