@@ -189,24 +189,21 @@ def _checkpoint_bool(path: Path, key: str) -> bool | None:
                 payload = stream.read(1 << 22)
         string_ops = {"BINUNICODE", "SHORT_BINUNICODE", "BINUNICODE8", "UNICODE"}
         integer_ops = {"INT", "BININT", "BININT1", "BININT2"}
-        operations = list(pickletools.genops(payload))
-        for index, (opcode, value, _position) in enumerate(operations[:-1]):
+        memo_ops = {"BINPUT", "LONG_BINPUT", "PUT", "MEMOIZE"}
+        operations = iter(pickletools.genops(payload))
+        for opcode, value, _position in operations:
             if opcode.name not in string_ops or value != key:
                 continue
-            next_index = index + 1
-            while next_index < len(operations) and operations[next_index][0].name in {
-                "BINPUT", "LONG_BINPUT", "PUT", "MEMOIZE"
-            }:
-                next_index += 1
-            if next_index >= len(operations):
+            for next_opcode, next_value, _next_position in operations:
+                if next_opcode.name in memo_ops:
+                    continue
+                if next_opcode.name == "NEWTRUE":
+                    return True
+                if next_opcode.name == "NEWFALSE":
+                    return False
+                if next_opcode.name in integer_ops and next_value in (0, 1):
+                    return bool(next_value)
                 return None
-            next_opcode, next_value, _next_position = operations[next_index]
-            if next_opcode.name == "NEWTRUE":
-                return True
-            if next_opcode.name == "NEWFALSE":
-                return False
-            if next_opcode.name in integer_ops and next_value in (0, 1):
-                return bool(next_value)
             return None
     except (OSError, EOFError, ValueError, zipfile.BadZipFile, StopIteration):
         return None
