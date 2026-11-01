@@ -18,7 +18,17 @@ const STEM_COLORS: Record<string, string> = {
 };
 const stemColor = (stem: string) => STEM_COLORS[stem] ?? "--src-other";
 
-export function LiveTranscription({ pid, player, active }: { pid: string; player: Player; active: boolean }) {
+export function LiveTranscription({
+  pid,
+  jobId,
+  player,
+  active,
+}: {
+  pid: string;
+  jobId: string;
+  player: Player;
+  active: boolean;
+}) {
   const t = useT();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const notes = useRef(new Map<string, { stem: string; note: LiveNote }>());
@@ -29,6 +39,17 @@ export function LiveTranscription({ pid, player, active }: { pid: string; player
   const [unsupported, setUnsupported] = useState(false);
   const stemsRef = useRef<LiveStem[]>([]);
   stemsRef.current = stems;
+
+  // A completed transcription can be followed by another job for the same
+  // project. Reset the incremental cursor and canvas data for each job ID.
+  useEffect(() => {
+    notes.current.clear();
+    seq.current = 0;
+    setStems([]);
+    setStage(null);
+    setProgress(null);
+    setUnsupported(false);
+  }, [pid, jobId]);
 
   // 1 秒ごとに、前回の続きのノートだけを取りに行く
   useEffect(() => {

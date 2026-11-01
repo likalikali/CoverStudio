@@ -614,7 +614,7 @@ function TranscribePanel({
         )}
       </div>
       {tr?.message && active && !tr.message.startsWith("@@") && <div className="transcribe-msg mono small">{progressText(t, tr.message)}</div>}
-      {tr?.job && <LiveTranscription pid={pid} player={player} active={active} />}
+      {tr?.job && <LiveTranscription pid={pid} jobId={tr.job} player={player} active={active} />}
       {tr?.log && tr.log.length > 0 && (
         <details className="log-box" open={tr.state === "error"}>
           <summary className="muted small">{t.showLog}</summary>
