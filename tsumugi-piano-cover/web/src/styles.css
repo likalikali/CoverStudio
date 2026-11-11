@@ -1101,6 +1101,14 @@ input[type="range"]:disabled {
   gap: 6px;
   margin-bottom: 16px;
 }
+/* 切り捨ての記録と「元に戻す」(detail-actions のすぐ下に出る) */
+.trim-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin: -8px 0 16px;
+}
 .params {
   width: 100%;
   border-collapse: collapse;

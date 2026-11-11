@@ -30,7 +30,7 @@ export type ModelEntry = {
 };
 
 // cover_studio/app.py の API_VERSION と同じにする (違えばサーバが古い)
-export const API_VERSION = 4;
+export const API_VERSION = 5;
 
 export type Config = {
   models: ModelEntry[];
@@ -47,6 +47,9 @@ export type Config = {
 export type TakeState = "queued" | "running" | "done" | "error" | "cancelled";
 
 export type ContinueFrom = { take: string; seconds: number };
+
+// 後処理で選んだ秒までテイクを切り捨てた記録 (cover_studio/midi_trim.py)
+export type TakeTrim = { cut: number; removed: number; created: string };
 
 export type TakeScore = {
   state: "queued" | "running" | "done" | "error" | "cancelled";
@@ -77,6 +80,7 @@ export type Take = {
   seed: number;
   count: number;
   continue_from: ContinueFrom | null;
+  trim?: TakeTrim | null;
   score?: TakeScore | null;
   job?: string;
   progress?: number | null;
@@ -236,6 +240,10 @@ export const api = {
     request<Take>(`${p(pid)}/takes/${tid}`, json("PATCH", body)),
   deleteTake: (pid: string, tid: string) => request<void>(`${p(pid)}/takes/${tid}`, { method: "DELETE" }),
   takeView: (pid: string, tid: string) => request<CoverView>(`${p(pid)}/takes/${tid}/view`),
+  // 選んだ秒でテイクの MIDI を切り捨てる (終わりの外れた音を捨てる後処理)
+  trimTake: (pid: string, tid: string, seconds: number) =>
+    request<ProjectDetail>(`${p(pid)}/takes/${tid}/trim`, json("POST", { seconds })),
+  undoTrim: (pid: string, tid: string) => request<ProjectDetail>(`${p(pid)}/takes/${tid}/trim/undo`, { method: "POST" }),
   score: (pid: string, tid: string, model: string | null) =>
     request<ProjectDetail>(`${p(pid)}/takes/${tid}/score`, json("POST", { model })),
   scoreXml: async (pid: string, tid: string) => {

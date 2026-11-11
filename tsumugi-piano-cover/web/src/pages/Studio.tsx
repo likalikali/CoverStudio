@@ -463,6 +463,19 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
                 setContinueFrom({ take: selectedTake.id, seconds: Math.round(seconds * 100) / 100 });
                 reuse(selectedTake);
               }}
+              onTrim={(seconds) =>
+                run(async () => {
+                  // 切り捨てたら巻物とプレーヤーも新しい音にする (takeView は無限に cache されるので明示的に無効化)
+                  refresh(await api.trimTake(pid, selectedTake.id, seconds));
+                  await qc.invalidateQueries({ queryKey: ["take-view", pid, selectedTake.id] });
+                })
+              }
+              onUndoTrim={() =>
+                run(async () => {
+                  refresh(await api.undoTrim(pid, selectedTake.id));
+                  await qc.invalidateQueries({ queryKey: ["take-view", pid, selectedTake.id] });
+                })
+              }
               onWav={() =>
                 run(async () => {
                   const view = takeView.data ?? (await api.takeView(pid, selectedTake.id));

@@ -141,6 +141,9 @@ type DetailProps = {
   onFavorite: () => void;
   onReuse: () => void;
   onContinue: (seconds: number) => void;
+  // 選んだ秒で後ろを切り捨てる (midi_trim.py)。失敗は呼び出し側の error に出る
+  onTrim: (seconds: number) => Promise<void>;
+  onUndoTrim: () => void;
   onWav: () => Promise<void>;
   onDelete: () => void;
   // 楽譜化 (原曲の音源のないプロジェクトでは scoreBlocked に理由を入れる)
@@ -276,6 +279,17 @@ export function TakeDetail(props: DetailProps) {
         >
           <Icon name="scissors" size={16} /> {t.continueHere}
         </button>
+        <button
+          className="btn"
+          disabled={!done}
+          onClick={() => {
+            const seconds = Math.max(0, Math.round(props.position() * 100) / 100);
+            if (confirm(t.confirmTrim(formatTime(seconds)))) void props.onTrim(seconds);
+          }}
+          title={t.trimHereHelp}
+        >
+          <Icon name="close" size={16} /> {t.trimHere}
+        </button>
         <a className={`btn ${done ? "" : "disabled"}`} href={done ? props.midiUrl : undefined} download>
           <Icon name="download" size={16} /> MIDI
         </a>
@@ -298,6 +312,15 @@ export function TakeDetail(props: DetailProps) {
           <Icon name="trash" size={16} />
         </button>
       </div>
+
+      {take.trim && (
+        <div className="trim-note small">
+          <span className="muted">{t.trimInfo(formatTime(take.trim.cut), take.trim.removed)}</span>
+          <button className="link" onClick={props.onUndoTrim} title={t.undoTrimHelp}>
+            {t.undoTrim}
+          </button>
+        </div>
+      )}
 
       <ScoreSection {...props} />
 
