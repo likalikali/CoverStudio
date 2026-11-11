@@ -71,3 +71,6 @@ cover_studio/static/
 node_modules/
 **/node_modules/
 
+
+# Playwright MCP test artifacts
+.playwright-mcp/
