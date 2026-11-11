@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tan
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { API_VERSION, api } from "./api";
-import { useLang, useT } from "./i18n";
+import { useLang, useT, nextLang } from "./i18n";
 import { Icon } from "./components/Icon";
 import { NewSongDialog } from "./components/NewSong";
 import { SongSwitcher } from "./components/SongSwitcher";
@@ -92,7 +92,7 @@ function App() {
         )}
         <button
           className="lang-btn"
-          onClick={() => setLang(lang === "ja" ? "en" : "ja")}
+          onClick={() => setLang(nextLang(lang))}
           title={t.languageHelp}
           aria-label={t.languageHelp}
         >

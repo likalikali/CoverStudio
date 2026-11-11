@@ -38,6 +38,7 @@ export function PianoRoll({ player, cover, source, showSource, continueAt, heigh
     const ctx = canvas.getContext("2d")!;
     let raf = 0;
     let colors: Record<string, string> = {};
+    let lastSeekEpoch = player.seekEpoch;
     const readColors = () => {
       const style = getComputedStyle(canvas);
       const names = [
@@ -73,6 +74,14 @@ export function PianoRoll({ player, cover, source, showSource, continueAt, heigh
 
       const pos = player.position();
       const v = view.current;
+      // 停止中でも seek で外へ飛んだら追いかける (下のシークバーや ±5 秒ボタン)。playEpoch を数えて
+      // 「クリックで見ている範囲の中を動いた」のと「範囲の外へ一気に飛んだ」を区別する
+      if (player.seekEpoch !== lastSeekEpoch) {
+        lastSeekEpoch = player.seekEpoch;
+        if (!player.playing && (pos > v.start + v.seconds * 0.9 || pos < v.start)) {
+          v.start = Math.max(0, pos - v.seconds * 0.1);
+        }
+      }
       // 再生中は再生位置が右端の 85% を越えたら次のページへ送る
       if (player.playing && (pos > v.start + v.seconds * 0.85 || pos < v.start)) {
         v.start = Math.max(0, pos - v.seconds * 0.1);

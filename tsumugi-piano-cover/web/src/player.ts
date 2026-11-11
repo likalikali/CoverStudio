@@ -36,6 +36,8 @@ export class Player {
   private anchorPos = 0;
   private pausedPos = 0;
   private timer: number | null = null;
+  /** seek・play で位置が動いた回数。停止中でもピアノロールが「見えている範囲の外へ飛んだ」ことを検出する */
+  seekEpoch = 0;
 
   loop: [number, number] | null = null;
   loopOn = false;
@@ -171,6 +173,7 @@ export class Player {
     void this.ctx.resume();
     let pos = from ?? this.pausedPos;
     if (pos >= this.duration - 0.05) pos = this.loopOn && this.loop ? this.loop[0] : 0;
+    this.seekEpoch++;
     this.start(pos);
     this.emit();
   }
@@ -190,6 +193,7 @@ export class Player {
 
   seek(pos: number) {
     pos = Math.max(0, Math.min(pos, this.duration));
+    this.seekEpoch++;
     if (this.playing) {
       this.stopSound();
       this.start(pos);

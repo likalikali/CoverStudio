@@ -1,9 +1,12 @@
-// 画面の文言 (日本語 / 英語)。選んだ言語はブラウザに覚えておく。
+// 画面の文言 (日本語 / English / 中文)。選んだ言語はブラウザに覚えておく。
 // サーバが返すエラーの文や tsumugi のログは訳さない (そのまま出す)
 import { useSyncExternalStore } from "react";
 import type { NumberKey } from "./params";
 
-export type Lang = "ja" | "en";
+export type Lang = "ja" | "en" | "zh";
+
+/** 言語ボタンの循環順 (ja → en → zh → ja) */
+export const LANG_ORDER: Lang[] = ["ja", "en", "zh"];
 
 type ParamText = { label: string; short: string; help: string };
 
@@ -30,8 +33,7 @@ const ja = {
   freeVramHelp: "カバーモデルを手放して VRAM を空ける (次の生成で読み直す)",
   device: "デバイス",
   language: "English",
-  languageHelp: "Switch to English",
-  // 曲の一覧
+  languageHelp: "Switch to English",  // 曲の一覧
   newSong: "新しい曲",
   dropHelp: "音源 (mp3 / wav / flac …) をドロップ。採譜済みの MIDI も一緒に入れると採譜を飛ばします",
   noTsumugi: " (tsumugi がないので MIDI が必要です)",
@@ -255,6 +257,257 @@ const ja = {
 };
 
 type Dict = typeof ja;
+
+const zh: Dict = {
+  lang: "zh-CN",
+  loading: "加载中…",
+  sec: "秒",
+  delete: "删除",
+  remove: "移除",
+  cancel: "取消",
+  stop: "停止",
+  close: "关闭",
+  switchSong: "切换歌曲",
+  searchSongs: "搜索歌曲",
+  allSongs: "查看全部歌曲",
+  noMatch: "没有找到",
+  noServer: "无法连接服务器，请启动 python -m cover_studio",
+  staleServer: "界面已更新，请重启服务器 (python -m cover_studio)",
+  songs: "歌曲列表",
+  noModelLoaded: "模型未加载",
+  freeVram: "释放显存",
+  freeVramHelp: "释放封面模型以腾出显存（下次生成时会重新加载）",
+  device: "设备",
+  language: "日本語",
+  languageHelp: "切换到日语",
+  newSong: "新建歌曲",
+  dropHelp: "拖入音源文件 (mp3 / wav / flac …)。同时放入已转录的 MIDI 可跳过转录",
+  noTsumugi: "（没有 tsumugi，需要 MIDI 文件）",
+  unsupportedFile: (name) => `不支持的文件：${name}`,
+  songTitle: "曲名",
+  uploading: "上传中…",
+  create: "创建",
+  createAndTranscribe: "创建并转录",
+  confirmDeleteSong: (title, takes) => `删除「${title}」及其 ${takes} 个 take 吗？`,
+  noSongs: "还没有歌曲",
+  statusQueued: "等待转录",
+  statusRunning: "转录中…",
+  statusFailed: "转录失败",
+  statusNoSource: "无原曲 MIDI",
+  takesCount: (n) => `${n} 个 take`,
+  generatingNow: "生成中…",
+  createTitle: "创建",
+  resetAll: "全部重置",
+  resetTo: (v) => `重置为默认值 (${v})`,
+  continueUntil: (take, time) => `保留 ${take} 到 ${time}`,
+  continueRest: "，只重新生成之后的部分",
+  model: "模型",
+  modelKinds: { export: "导出的权重", checkpoint: "训练检查点", hub: "Hugging Face" },
+  loaded: " ● 已加载",
+  length: "长度",
+  lengthHelp: "先试听短片段更快。找到满意的设置后再生成全曲",
+  fullSong: "全曲",
+  arrangementSwitch: "关闭后不指定编曲倾向",
+  beatGridRhythmNote: "拍子 token 的 V2 由模型内置的 OnsetHead 处理节奏对齐。此滑杆仅对时间 token 的 V1 生效。",
+  performer: "演奏者",
+  performerNumber: "编号",
+  addPerformer: (n) => `收藏 #${n}`,
+  addPerformerHelp: "把当前编号保存为常用演奏者",
+  removePerformer: (n) => `移除 #${n}`,
+  performerHelp: (max) => `0 表示不指定${max ? `（1–${max}）` : ""}`,
+  styleTitle: "偏好",
+  styleNote: "从收藏的 take 学习一位演奏者，代替编号使用。仅在学习时的模型上可用（V2 及以后）",
+  learnStyle: (n, songs) => `从 ${n} 个收藏 (${songs} 首歌) 学习`,
+  learnStyleHelp: "使用所有有音源的歌曲的收藏。来自不同歌曲的 10 个以上收藏会更稳定",
+  noStyleFavorites: "还没有收藏（需要有音源的歌曲）",
+  styleQueued: "排队等待学习",
+  styleTraining: "学习中",
+  styleFailed: "学习失败",
+  styleCancelled: "已停止",
+  styleUnusable: "当前选择的偏好不能用于这个模型",
+  styleName: "偏好名称",
+  styleInfo: (used, before, after) =>
+    `用 ${used} 个 take 学习 · 损失 ${before.toFixed(3)} → ${after.toFixed(3)}（双击重命名）`,
+  deleteStyle: (name) => `删除 ${name}`,
+  confirmDeleteStyle: (name) => `删除偏好「${name}」吗？`,
+  stylePrepare: (i, n) => `正在准备歌曲 ${i} / ${n}`,
+  styleSteps: (done, total, loss) => `${done} / ${total} 步（损失 ${loss}）`,
+  countHelp: "用相同设置一次生成的数量",
+  seedHelp: "固定后，相同设置会得到相同结果",
+  random: "随机",
+  generate: "生成",
+  regenerateRest: "重新生成后半段",
+  waitForSource: "请等待原曲 MIDI 完成",
+  noModels: "没有可用模型",
+  groups: {
+    source: { title: "原曲", note: "" },
+    expression: { title: "表现", note: "将 Planner 从原曲预测的曲线放大多少倍（0 表示不指定）" },
+    arrangement: {
+      title: "编曲",
+      note: "在全部封面作品的标准差单位上平移 Planner 的预测（0 表示按预测）",
+    },
+    sampling: { title: "采样", note: "" },
+  },
+  params: {
+    source_cfg: {
+      label: "贴近原曲程度",
+      short: "贴近原曲",
+      help: "大于 1 时更贴合原曲（旋律、和弦）。过高会显得生硬",
+    },
+    onset_bias: {
+      label: "贴合原曲节奏",
+      short: "节奏贴合",
+      help: "把音符起点拉向原曲起点（所有乐器和拍子）的力度。0 表示关闭，4 左右效果较好",
+    },
+    dynamics: {
+      label: "强弱对比",
+      short: "强弱",
+      help: "缩放音量曲线的峰谷。1 ≈ 训练数据；更大时副歌更有起伏",
+    },
+    density: {
+      label: "密度对比",
+      short: "密度",
+      help: "缩放音符密度曲线。更大时安静段与热闹段反差更强",
+    },
+    fill: {
+      label: "填充与助奏",
+      short: "填充",
+      help: "填补旋律空隙的音量。约 +0.5 相当于爱加花的演奏者",
+    },
+    above: {
+      label: "旋律上方叠音",
+      short: "上方叠音",
+      help: "在旋律上方叠加音符的比例（旋律并非总是最高音）",
+    },
+    span: { label: "音域宽度", short: "音域", help: "从低音到高音的跨度" },
+    temperature: { label: "temperature", short: "temp", help: "越高越大胆，越低越保守" },
+    top_p: {
+      label: "top-p",
+      short: "top-p",
+      help: "只从累计概率达到 p 的高概率候选中采样。越小越保守",
+    },
+    channel_cfg: {
+      label: "演奏者风格强度",
+      short: "演奏者风格",
+      help: "大于 1 时强化所选演奏者的风格（仅在选择了演奏者时生效）",
+    },
+    onset_bias_width: { label: "贴合范围", short: "贴合范围", help: "向原曲起点贴合的时间窗口（秒）" },
+  },
+  chipPerformer: (n) => `演奏者 #${n}`,
+  chipStyle: (name) => `偏好「${name}」`,
+  deletedStyle: "已删除",
+  chipNoArrangement: "无编曲指定",
+  chipSeconds: (n) => `${n} 秒`,
+  noAudio: "无音源",
+  sourceMidi: "原曲 MIDI",
+  sourceByTsumugi: "tsumugi 转录",
+  sourceUploaded: "已上传",
+  sourceNotYet: "尚未完成",
+  replaceMidi: "替换 MIDI",
+  replaceMidiHelp: "用手头的 MIDI 文件作为原曲",
+  sourceMidiTitle: "原曲 MIDI",
+  overlaySource: "叠加显示原曲 MIDI",
+  legend: ["旋律", "低音", "键盘", "吉他", "其他"],
+  rollHint: "点击跳转 · 拖拽设置循环 · 滚轮横向移动（Ctrl 缩放）· ↑↓ 切换 take 并保持位置",
+  clearLoop: (a, b) => `清除循环 ${a}–${b}`,
+  view: "显示",
+  viewSeconds: "显示的秒数",
+  rollCollapse: "收起",
+  rollExpand: "展开",
+  viewSwitch: "切换视图",
+  tabCreate: "创建",
+  tabPlay: "播放",
+  tabDetail: "详情",
+  takes: "Take",
+  all: "全部",
+  noFavorites: "还没有收藏",
+  emptyTakes: "点左侧的「生成」创建 take。可随时改设置重新生成",
+  waitTranscribe: "转录完成后即可创建 take",
+  confirmDeleteTake: (name) => `删除 ${name} 吗？`,
+  selectTakeHint: "选择一个 take，在此查看其设置和备注",
+  loadingAudio: "加载音源中…",
+  original: "原曲",
+  chooseTake: "请选择 take",
+  transcribeQueued: "排队等待转录",
+  transcribeRunning: "tsumugi 正在转录",
+  transcribeFailed: "转录失败",
+  transcribeCancelled: "转录已停止",
+  transcribeNone: "无原曲 MIDI",
+  transcribeSteps:
+    "音轨分离 → 转录 → 乐器识别 → 力度 → 拍子与和弦。每首歌需要几分钟（只需一次）",
+  transcribeHint: "从音源转录，或放入已有的 MIDI 文件",
+  transcribe: "开始转录",
+  transcribeStages: {
+    separate: "音轨分离",
+    transcribe: "转录",
+    refine: "乐器识别",
+    velocity: "力度",
+    beat: "拍子与和弦",
+  },
+  stems: { vocals: "人声", bass: "贝斯", piano: "钢琴", guitar: "吉他", other: "其他", drums: "鼓" },
+  showLog: "日志",
+  liveNote: "已转录的音符会实时显示（乐器识别和力度处理前）",
+  take: (n) => `Take ${n}`,
+  batchHelp: "用相同设置一次生成的一组",
+  play: "播放",
+  defaultSettings: "默认设置",
+  queued: "排队中",
+  generating: "生成中",
+  stopping: "停止中",
+  preparingModel: "正在准备模型",
+  startingTsumugi: "正在启动 tsumugi",
+  analyzingBeats: "正在预测原曲的拍子和旋律",
+  stopped: "已停止",
+  notes: (n) => `${n} 个音`,
+  favorite: "收藏 (F)",
+  reuseHelp: "把这些设置填入「创建」",
+  continueChip: (take, time) => `从 ${take} 的 ${time} 起`,
+  reuse: "复用设置",
+  continueHere: "从这里重新生成",
+  continueHereHelp: "保留播放位置（或循环起点）之前的部分，重新生成之后的内容",
+  trimHere: "从此处截断",
+  trimHereHelp: "丢弃播放位置（或循环起点）之后的音符。用于处理结尾错音的后处理",
+  confirmTrim: (time) => `丢弃 ${time} 之后的音符吗？（可以撤销）`,
+  trimInfo: (time, notes) => `已在 ${time} 截断 ${notes} 个音`,
+  undoTrim: "撤销截断",
+  undoTrimHelp: "恢复到最近一次截断之前（一级）",
+  wav: "WAV",
+  wavRendering: "导出中…",
+  wavHelp: "用钢琴音源导出为 WAV",
+  seed: "seed",
+  fullLength: "全曲",
+  notSpecified: "不指定",
+  defaultValue: (v) => `（默认 ${v}）`,
+  memo: "备注",
+  memoPlaceholder: "记下你的发现（例如副歌的加花很棒）",
+  pianoLoading: (p) => `正在加载钢琴音源 ${p}%`,
+  pianoFallback: "钢琴音源不可用，使用简易合成音",
+  back5: "后退 5 秒（←）",
+  forward5: "前进 5 秒（→）",
+  playPause: "播放 / 暂停（空格）",
+  loopHelp: "循环 (L)。在钢琴卷帘上拖拽选择区间",
+  cover: "封面",
+  mixHelp: "原曲与封面的音量分配（双击居中）",
+  mixLabel: "原曲与封面音量的分配",
+  score: "乐谱",
+  scoreModel: "制谱模型",
+  makeScore: "生成乐谱",
+  remakeScore: "重新生成",
+  openScore: "打开乐谱",
+  scoreHelp: "把这个 take 转成乐谱（MusicXML），按原曲拍子划小节线并标注和弦",
+  scoreQueued: "排队等待制谱",
+  scoring: "正在制谱",
+  scoreBars: (done, total) => `${done} / ${total} 小节`,
+  scoreDone: (n) => `${n ?? "?"} 小节`,
+  scoreNeedsAudio: "制谱需要原曲音源（用于拍子）",
+  noScoreModels: "没有可用的制谱模型",
+  print: "打印 / PDF",
+  printHelp: "用浏览器打印为纸张或 PDF（A4）",
+  zoomIn: "放大",
+  zoomOut: "缩小",
+  scoreLoading: "正在绘制乐谱…",
+  scoreRenderFailed: "无法绘制乐谱",
+};
 
 const en: Dict = {
   lang: "en-US",
@@ -508,16 +761,19 @@ const en: Dict = {
   scoreRenderFailed: "Could not engrave the score",
 };
 
-const DICTS: Record<Lang, Dict> = { ja, en };
+const DICTS: Record<Lang, Dict> = { ja, en, zh };
 
 function initialLang(): Lang {
   try {
     const saved = localStorage.getItem("cover-studio:lang");
-    if (saved === "ja" || saved === "en") return saved;
+    if (saved === "ja" || saved === "en" || saved === "zh") return saved;
   } catch {
     // 覚えておけない環境ではブラウザの言語から
   }
-  return navigator.language.toLowerCase().startsWith("ja") ? "ja" : "en";
+  const lang = navigator.language.toLowerCase();
+  if (lang.startsWith("ja")) return "ja";
+  if (lang.startsWith("zh")) return "zh";
+  return "en";
 }
 
 let current: Lang = initialLang();
@@ -537,6 +793,11 @@ export function setLang(lang: Lang) {
 
 export function getLang(): Lang {
   return current;
+}
+
+/** 言語ボタンが次に切り替える先 (ja → en → zh → ja) */
+export function nextLang(lang: Lang = current): Lang {
+  return LANG_ORDER[(LANG_ORDER.indexOf(lang) + 1) % LANG_ORDER.length];
 }
 
 const subscribe = (l: () => void) => {
