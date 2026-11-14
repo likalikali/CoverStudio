@@ -2,15 +2,18 @@
 
 The cover model sometimes starts a song late: the source MIDI has an intro,
 but the generated take stays silent until the arrangement begins. This module
-splices the source's notes before a chosen time point into the take, so the
-transcribed intro is heard again. The take keeps everything from the time
-point onward (an edit seam at the playhead), its tempo/marker metadata is
-untouched, and the drums (channel 9) of the source are not copied.
+fills that gap with the source's notes. The take's own notes are NEVER touched:
+the seam is clamped to the take's first note, so the operation only adds the
+transcribed head that the model skipped (source notes before the seam, clipped
+at it, drums on channel 9 excluded, a held sustain pedal released there).
 
 Ticks are mapped through each file's own tempo map (source tick -> seconds ->
 take tick), so per-bar tempo changes written by SheetSage are respected even
 when the two files' maps differ. A one-level backup (``cover.mid.pre_splice.bak``)
 is written next to the MIDI before each splice so it can be undone.
+
+Note pairing is FIFO (first note_on with the first note_off of the same pitch),
+matching how symusic reads the file, so kept notes always keep their note_offs.
 """
 
 from __future__ import annotations
@@ -70,39 +73,56 @@ def _is_note_off(message) -> bool:
     return message.type == "note_off" or (message.type == "note_on" and message.velocity == 0)
 
 
-def _source_head_events(src_midi, cut_tick: int) -> tuple[list[tuple[int, object]], int]:
-    """Channel events before the cut (notes clipped at it, pedal released there), remapped
-    to the take's timeline later. Meta events are not copied: the take already has them.
+def _pair_notes(events: list[tuple[int, int, object]]) -> dict[int, int]:
+    """order -> partner order for note_on/note_off, paired FIFO like symusic reads
+    the file (the first note_on of a pitch pairs with its first note_off)."""
+    partners: dict[int, int] = {}
+    open_ons: dict[tuple[int, int], list[int]] = {}
+    for _tick, order, message in events:
+        if message.type == "note_on" and message.velocity > 0:
+            open_ons.setdefault((message.channel, message.note), []).append(order)
+        elif _is_note_off(message):
+            stack = open_ons.get((message.channel, message.note))
+            if stack:
+                on_order = stack.pop(0)
+                partners[on_order] = order
+                partners[order] = on_order
+    return partners
 
-    Returns (events with absolute ticks in the *source* timeline, kept note count).
+
+def _source_head_events(src_midi, cut_tick: int) -> tuple[list[tuple[int, object]], int]:
+    """Source channel events whose note starts before the cut (notes clipped at it,
+    pedal released there), in the *source* timeline. Meta events are not copied:
+    the take already has its own. Drums (channel 9) are not part of the cover.
+
+    Returns (events, added note count).
     """
-    out = []
-    kept = 0
+    out: list[tuple[int, object]] = []
+    added = 0
     for track in src_midi.tracks:
-        events = _absolute(track)
+        events = [
+            e
+            for e in _absolute(track)
+            if not e[2].is_meta
+            and e[2].type != "end_of_track"
+            and getattr(e[2], "channel", None) != DRUM_CHANNEL
+        ]
+        partners = _pair_notes(events)
+        onsets = {order: tick for tick, order, m in events if m.type == "note_on" and m.velocity > 0}
+
         decisions: dict[int, int | None] = {}
-        open_notes: dict[tuple[int, int], list[int]] = {}
         for tick, order, message in events:
-            if message.type == "end_of_track" or message.is_meta:
-                decisions[order] = None  # the take carries its own metadata
-            elif getattr(message, "channel", None) == DRUM_CHANNEL:
-                decisions[order] = None  # drums are not part of the piano cover
-            elif message.type == "note_on" and message.velocity > 0:
-                if tick >= cut_tick:
-                    decisions[order] = None
+            is_on = message.type == "note_on" and message.velocity > 0
+            if is_on or _is_note_off(message):
+                # A note belongs to the head when its note_on starts before the
+                # cut; its note_off follows the note (clipped at the cut).
+                onset = onsets.get(order, onsets.get(partners.get(order, -1), tick))
+                if onset < cut_tick:
+                    decisions[order] = tick if is_on else min(tick, cut_tick)
+                    if is_on:
+                        added += 1
                 else:
-                    decisions[order] = tick
-                    kept += 1
-                    open_notes.setdefault((message.channel, message.note), []).append(order)
-            elif _is_note_off(message):
-                stack = open_notes.get((message.channel, message.note))
-                on_order = stack.pop() if stack else None
-                if on_order is None:
-                    decisions[order] = tick if tick <= cut_tick else None
-                elif decisions[on_order] is None:
                     decisions[order] = None
-                else:
-                    decisions[order] = min(tick, cut_tick)  # shorten the crossing note
             else:
                 decisions[order] = tick if tick <= cut_tick else None
 
@@ -125,59 +145,17 @@ def _source_head_events(src_midi, cut_tick: int) -> tuple[list[tuple[int, object
             out.append((new_tick, message))
         for message in pedal_ups:
             out.append((cut_tick, message))
-    return out, kept
+    return out, added
 
 
-def _take_tail_events(take_midi, cut_tick: int) -> tuple[list[list], int, int]:
-    """All meta (timeline intact) plus channel events from the cut onward.
-
-    Notes whose onset is before the cut are dropped whole (their note-offs too):
-    the head is being replaced by the source. Returns (tracks, kept notes,
-    dropped notes).
-    """
-    tracks = []
-    kept = dropped = 0
-    for track in take_midi.tracks:
-        events = _absolute(track)
-        decisions: dict[int, int | None] = {}
-        open_notes: dict[tuple[int, int], list[int]] = {}
-        for tick, order, message in events:
-            if message.type == "end_of_track":
-                decisions[order] = None  # re-appended below
-            elif message.is_meta or message.type == "program_change":
-                decisions[order] = tick  # tempo / markers / setup stay for the whole song
-            elif message.type == "note_on" and message.velocity > 0:
-                if tick < cut_tick:
-                    decisions[order] = None
-                    dropped += 1
-                    open_notes.setdefault((message.channel, message.note), []).append(order)
-                else:
-                    decisions[order] = tick
-                    kept += 1
-            elif _is_note_off(message):
-                stack = open_notes.get((message.channel, message.note))
-                if stack:
-                    decisions[order] = None  # its note was dropped with the head
-                else:
-                    decisions[order] = tick if tick >= cut_tick else None
-            else:
-                decisions[order] = tick if tick >= cut_tick else None
-
-        kept_events = []
-        for tick, order, message in events:
-            new_tick = decisions.get(order)
-            if new_tick is None:
-                continue
-            kept_events.append((new_tick, order, message))
-        kept_events.sort(key=lambda item: (item[0], item[1]))
-        rebuilt = mido.MidiTrack()
-        previous = 0
-        for new_tick, _order, message in kept_events:
-            rebuilt.append(message.copy(time=new_tick - previous))
-            previous = new_tick
-        rebuilt.append(mido.MetaMessage("end_of_track", time=0))
-        tracks.append(rebuilt)
-    return tracks, kept, dropped
+def _first_note_tick(midi) -> int | None:
+    ticks = [
+        tick
+        for track in midi.tracks
+        for tick, _order, message in _absolute(track)
+        if message.type == "note_on" and message.velocity > 0
+    ]
+    return min(ticks) if ticks else None
 
 
 def _rebuild_track(events: list[tuple[int, object]]) -> mido.MidiTrack:
@@ -191,12 +169,12 @@ def _rebuild_track(events: list[tuple[int, object]]) -> mido.MidiTrack:
 
 
 def splice_head_from_source(take_path: str | Path, source_path: str | Path, seconds: float) -> dict:
-    """Fill ``take_path``'s head with the source's notes before ``seconds``.
+    """Fill ``take_path``'s head gap with the source's notes, at most up to ``seconds``.
 
-    Everything from ``seconds`` onward in the take is kept unchanged (whole
-    notes starting before the seam are dropped: the seam replaces the head).
-    Raises ValueError when the position does not fit, and leaves the original
-    file untouched if the merged export does not validate.
+    The seam is clamped to the take's first note: existing take notes are never
+    changed or removed, only the silence before them is filled. Raises ValueError
+    when the position does not fit, and leaves the original file untouched if the
+    merged export does not validate.
     """
     take_path = Path(take_path)
     source_path = Path(source_path)
@@ -217,9 +195,15 @@ def splice_head_from_source(take_path: str | Path, source_path: str | Path, seco
     src_midi = mido.MidiFile(str(source_path))
     take_segments, take_tpb = _tempo_map(take_midi)
     src_segments, src_tpb = _tempo_map(src_midi)
-    take_cut = _seconds_to_tick(take_segments, take_tpb, seconds)
-    src_cut = _seconds_to_tick(src_segments, src_tpb, seconds)
 
+    # Never touch notes the take already plays: clamp the seam to its first note.
+    cut_tick = _seconds_to_tick(take_segments, take_tpb, seconds)
+    first_tick = _first_note_tick(take_midi)
+    if first_tick is not None:
+        cut_tick = min(cut_tick, first_tick)
+    effective_seconds = _tick_to_seconds(take_segments, take_tpb, cut_tick)
+
+    src_cut = _seconds_to_tick(src_segments, src_tpb, effective_seconds)
     head_events, added = _source_head_events(src_midi, src_cut)
     # Move the source's events onto the take's timeline (identical tempo maps
     # give identical ticks; different ones are converted second by second).
@@ -230,10 +214,15 @@ def splice_head_from_source(take_path: str | Path, source_path: str | Path, seco
         else:
             new_tick = _seconds_to_tick(take_segments, take_tpb, _tick_to_seconds(src_segments, src_tpb, tick))
         mapped.append((new_tick, message))
-    tail_tracks, tail_notes, dropped = _take_tail_events(take_midi, take_cut)
 
+    original_notes = sum(
+        1
+        for track in take_midi.tracks
+        for message in track
+        if message.type == "note_on" and message.velocity > 0
+    )
     head_track = _rebuild_track(mapped)
-    take_midi.tracks = [*tail_tracks, head_track]
+    take_midi.tracks = [*take_midi.tracks, head_track]
 
     temporary = take_path.with_name(take_path.name + ".splice.tmp")
     backup = take_path.with_name(take_path.name + BACKUP_SUFFIX)
@@ -241,23 +230,19 @@ def splice_head_from_source(take_path: str | Path, source_path: str | Path, seco
         take_midi.save(str(temporary))
         checked = mido.MidiFile(str(temporary))
         checked_duration = midi_duration_seconds(temporary)
-        head_count = sum(
+        head_count = sum(1 for message in head_track if message.type == "note_on" and message.velocity > 0)
+        checked_notes = sum(
             1
-            for message in head_track
-            if message.type == "note_on" and message.velocity > 0
-        )
-        tail_count = sum(
-            1
-            for track in tail_tracks
+            for track in checked.tracks
             for message in track
             if message.type == "note_on" and message.velocity > 0
         )
-        if head_count != added or tail_count != tail_notes:
+        if head_count != added or checked_notes != original_notes + added:
             raise ValueError("検証に失敗しました: 書き出した音符の数が合いません")
-        if not math.isfinite(checked_duration) or checked_duration > max(take_duration, seconds) + SLACK_SECONDS:
+        upper = max(take_duration, effective_seconds) + SLACK_SECONDS
+        lower = min(take_duration, effective_seconds) - SLACK_SECONDS
+        if not math.isfinite(checked_duration) or checked_duration > upper or checked_duration < lower:
             raise ValueError(f"検証に失敗しました: 結合後の長さが異常です ({checked_duration / 60:.1f} 分)")
-        if checked_duration < seconds - SLACK_SECONDS:
-            raise ValueError("検証に失敗しました: 結合後に音が残っていません")
         # Overwrite the backup so undo always restores the state right before
         # the latest splice (one undo level).
         shutil.copy2(take_path, backup)
@@ -266,10 +251,10 @@ def splice_head_from_source(take_path: str | Path, source_path: str | Path, seco
         if temporary.exists():
             temporary.unlink(missing_ok=True)
     return {
-        "cut": round(seconds, 3),
+        "cut": round(effective_seconds, 3),
         "added": added,
-        "removed": dropped,
-        "notes": added + tail_notes,
+        "removed": 0,
+        "notes": original_notes + added,
         "duration": round(midi_duration_seconds(take_path), 3),
     }
 
