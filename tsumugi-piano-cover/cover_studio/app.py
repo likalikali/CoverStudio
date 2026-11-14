@@ -4,7 +4,8 @@
   プロジェクト : GET/POST /api/projects、GET/PATCH/DELETE /api/projects/{pid}
   原曲         : POST …/transcribe、PUT …/source (手元の MIDI)、GET …/audio、…/source.mid、…/source/view
   テイク       : POST …/takes (生成)、PATCH/DELETE …/takes/{tid}、POST …/takes/{tid}/trim (選んだ秒まで切り捨て) と
-                 …/trim/undo (直前の切り捨てを元に戻す)、GET …/takes/{tid}/cover.mid、…/view
+                 …/trim/undo (直前の切り捨てを元に戻す)、…/takes/{tid}/splice (原曲で頭を補う) と …/splice/undo、
+                 GET …/takes/{tid}/cover.mid、…/view
   好み         : GET/POST /api/styles (お気に入りから学習)、PATCH/DELETE /api/styles/{sid}
   ジョブ       : GET /api/jobs、DELETE /api/jobs/{id} (取り消し・停止)
 
@@ -36,7 +37,7 @@ from .web import STATIC_DIR
 log = logging.getLogger(__name__)
 
 # API を変えたら上げる。画面 (web/src/api.ts の API_VERSION) と違えば、画面がサーバの起動し直しを促す
-API_VERSION = 5
+API_VERSION = 6
 AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac")
 MIDI_EXTS = (".mid", ".midi")
 # 画面の設定の既定値 (CoverParams の既定値のうち、Cover Studio だけで変えるもの)。拍のトークンのモデル (b4 / 5a) を
@@ -91,6 +92,12 @@ class TakePatch(BaseModel):
 
 class TrimIn(BaseModel):
     """テイクをどこで切り捨てるか (秒。ピアノロール・再生と同じ時計)"""
+
+    seconds: float = Field(gt=0)
+
+
+class SpliceIn(BaseModel):
+    """原曲で頭をどこまで補うか (秒。この位置より前を原曲の音で埋める)"""
 
     seconds: float = Field(gt=0)
 
@@ -464,12 +471,12 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
                 raise HTTPException(409, "生成中・待ち、または好みの学習中のテイクは先に処理を止めてください")
             p.delete_take(tid)
 
-    # ------------------------------------------------------------ 切り捨て (後処理)
-    def trim_allowed(p: Project, pid: str, tid: str) -> dict:
-        """切り捨ててよい状態か (生成・楽譜化・好みの学習とぶつからないか)。問題なければテイクを返す"""
+    # ------------------------------------------------------------ 切り捨て・頭の補完 (後処理)
+    def take_edit_allowed(p: Project, pid: str, tid: str) -> dict:
+        """後処理 (切り捨て・頭の補完) してよい状態か。問題なければテイクを返す"""
         take = find_take(p, tid)
         if take["state"] != "done":
-            raise HTTPException(400, "生成が終わったテイクだけ切り捨てられます")
+            raise HTTPException(400, "生成が終わったテイクだけ処理できます")
         if any(tid in j.takes for j in runner.active_for(pid)) or any(j.kind == "style" for j in runner.active_for("")):
             raise HTTPException(409, "生成中・待ち、または好みの学習中のテイクは先に処理を止めてください")
         return take
@@ -481,7 +488,7 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
         with runner.project_lock(pid):
             p = open_project(pid)
-            take = trim_allowed(p, pid, tid)
+            take = take_edit_allowed(p, pid, tid)
             path = p.take_midi(tid)
             if not path.is_file():
                 raise HTTPException(404, "まだ生成していません")
@@ -509,7 +516,7 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
 
         with runner.project_lock(pid):
             p = open_project(pid)
-            trim_allowed(p, pid, tid)
+            take_edit_allowed(p, pid, tid)
             path = p.take_midi(tid)
             if not path.is_file():
                 raise HTTPException(404, "まだ生成していません")
@@ -520,6 +527,55 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
             score_path = p.take_dir(tid) / "score.musicxml"
             score_path.unlink(missing_ok=True)
             p.update_take(tid, duration=result["duration"], notes=result["notes"], trim=None, score=None)
+            return detail(p)
+
+    @app.post("/api/projects/{pid}/takes/{tid}/splice")
+    def splice_take(pid: str, tid: str, body: SpliceIn):
+        """選んだ秒より前を原曲 MIDI の音で埋める (モデルが前奏を飛ばしたときの後処理。元に戻せる)"""
+        from .midi_splice import splice_head_from_source
+
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            take = take_edit_allowed(p, pid, tid)
+            if not p.has_source:
+                raise HTTPException(400, "原曲の MIDI がないので頭を補えません")
+            path = p.take_midi(tid)
+            if not path.is_file():
+                raise HTTPException(404, "まだ生成していません")
+            validate_take_midi(p, take, path)
+            try:
+                result = splice_head_from_source(path, p.source_path, body.seconds)
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from e
+            score_path = p.take_dir(tid) / "score.musicxml"
+            score_path.unlink(missing_ok=True)
+            p.update_take(
+                tid,
+                duration=result["duration"],
+                notes=result["notes"],
+                splice={"cut": result["cut"], "added": result["added"], "removed": result["removed"], "created": now()},
+                score=None,
+            )
+            return detail(p)
+
+    @app.post("/api/projects/{pid}/takes/{tid}/splice/undo")
+    def undo_splice(pid: str, tid: str):
+        """直前の頭の補完を元に戻す (バックアップは 1 段階だけ持っている)"""
+        from .midi_splice import undo_splice as undo_head_splice
+
+        with runner.project_lock(pid):
+            p = open_project(pid)
+            take_edit_allowed(p, pid, tid)
+            path = p.take_midi(tid)
+            if not path.is_file():
+                raise HTTPException(404, "まだ生成していません")
+            try:
+                result = undo_head_splice(path)
+            except FileNotFoundError as e:
+                raise HTTPException(404, str(e)) from e
+            score_path = p.take_dir(tid) / "score.musicxml"
+            score_path.unlink(missing_ok=True)
+            p.update_take(tid, duration=result["duration"], notes=result["notes"], splice=None, score=None)
             return detail(p)
 
     def expected_take_midi_end(p: Project, take: dict) -> float | None:

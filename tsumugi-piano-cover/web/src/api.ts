@@ -30,7 +30,7 @@ export type ModelEntry = {
 };
 
 // cover_studio/app.py の API_VERSION と同じにする (違えばサーバが古い)
-export const API_VERSION = 5;
+export const API_VERSION = 6;
 
 export type Config = {
   models: ModelEntry[];
@@ -50,6 +50,9 @@ export type ContinueFrom = { take: string; seconds: number };
 
 // 後処理で選んだ秒までテイクを切り捨てた記録 (cover_studio/midi_trim.py)
 export type TakeTrim = { cut: number; removed: number; created: string };
+
+// 後処理で原曲から頭を補った記録 (cover_studio/midi_splice.py)
+export type TakeSplice = { cut: number; added: number; removed: number; created: string };
 
 export type TakeScore = {
   state: "queued" | "running" | "done" | "error" | "cancelled";
@@ -81,6 +84,7 @@ export type Take = {
   count: number;
   continue_from: ContinueFrom | null;
   trim?: TakeTrim | null;
+  splice?: TakeSplice | null;
   score?: TakeScore | null;
   job?: string;
   progress?: number | null;
@@ -244,6 +248,11 @@ export const api = {
   trimTake: (pid: string, tid: string, seconds: number) =>
     request<ProjectDetail>(`${p(pid)}/takes/${tid}/trim`, json("POST", { seconds })),
   undoTrim: (pid: string, tid: string) => request<ProjectDetail>(`${p(pid)}/takes/${tid}/trim/undo`, { method: "POST" }),
+  // 選んだ秒より前を原曲 MIDI の音で埋める (モデルが前奏を飛ばしたときの後処理)
+  spliceTake: (pid: string, tid: string, seconds: number) =>
+    request<ProjectDetail>(`${p(pid)}/takes/${tid}/splice`, json("POST", { seconds })),
+  undoSplice: (pid: string, tid: string) =>
+    request<ProjectDetail>(`${p(pid)}/takes/${tid}/splice/undo`, { method: "POST" }),
   score: (pid: string, tid: string, model: string | null) =>
     request<ProjectDetail>(`${p(pid)}/takes/${tid}/score`, json("POST", { model })),
   scoreXml: async (pid: string, tid: string) => {

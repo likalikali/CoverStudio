@@ -476,6 +476,19 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
                   await qc.invalidateQueries({ queryKey: ["take-view", pid, selectedTake.id] });
                 })
               }
+              onSplice={(seconds) =>
+                run(async () => {
+                  // 補ったら巻物とプレーヤーも新しい音にする
+                  refresh(await api.spliceTake(pid, selectedTake.id, seconds));
+                  await qc.invalidateQueries({ queryKey: ["take-view", pid, selectedTake.id] });
+                })
+              }
+              onUndoSplice={() =>
+                run(async () => {
+                  refresh(await api.undoSplice(pid, selectedTake.id));
+                  await qc.invalidateQueries({ queryKey: ["take-view", pid, selectedTake.id] });
+                })
+              }
               onWav={() =>
                 run(async () => {
                   const view = takeView.data ?? (await api.takeView(pid, selectedTake.id));
